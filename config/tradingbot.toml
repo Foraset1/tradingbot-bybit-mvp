@@ -1,0 +1,45 @@
+[bybit]
+public_ws_url = "wss://stream.bybit.com/v5/public/linear"
+symbols = [
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "XRPUSDT",
+    "BNBUSDT",
+    "LINKUSDT",
+]
+heartbeat_seconds = 20
+stale_connection_seconds = 60.0
+reconnect_min_seconds = 1.0
+reconnect_max_seconds = 30.0
+
+[market]
+orderbook_depth = 50
+orderbook_snapshot_ms = 1000
+ticker_snapshot_ms = 1000
+kline_intervals = ["1", "5", "15"]
+collect_orderbook = true
+collect_trades = true
+collect_tickers = true
+collect_klines = true
+
+[storage]
+root = "data/raw"
+segment_seconds = 300
+segment_max_bytes = 134217728
+flush_seconds = 1.0
+queue_maxsize = 100000
+min_free_bytes = 10737418240
+health_path = "runtime/collector-health.json"
+
+[risk]
+# These values are documented now and will only be used by a later trading service.
+max_notional_fraction = 0.05
+target_risk_fraction = 0.005
+max_planned_risk_fraction = 0.007
+rolling_24h_loss_fraction = 0.01
+max_open_positions = 1
+max_hold_seconds = 3600
+soft_exit_seconds = 3300
+forced_exit_seconds = 3540
+entry_order_ttl_seconds = 45

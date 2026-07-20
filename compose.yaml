@@ -1,0 +1,47 @@
+services:
+  collector:
+    build: .
+    init: true
+    restart: unless-stopped
+    environment:
+      TRADINGBOT_CONFIG: /app/config/tradingbot.toml
+      TRADINGBOT_DATA_ROOT: /data/raw
+      TRADINGBOT_HEALTH_PATH: /app/runtime/collector-health.json
+    volumes:
+      - market-data:/data
+      - collector-runtime:/app/runtime
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 4g
+    cpus: 2.0
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import json,time;
+          h=json.load(open('/app/runtime/collector-health.json',encoding='utf-8'));
+          assert h.get('status') == 'connected';
+          assert h.get('subscription_confirmed') is True;
+          assert not h.get('fatal_error');
+          assert not h.get('current_connection_missing_topics');
+          assert time.time()*1000-h.get('updated_at_ms',0) < 90000
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
+
+volumes:
+  market-data:
+  collector-runtime:

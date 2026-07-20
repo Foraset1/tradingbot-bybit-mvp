@@ -1,0 +1,15 @@
+.git
+.github
+.venv
+.tmp
+.test-tmp
+.codex-pytest-*
+pytest-cache-files-*
+__pycache__
+.pytest_cache
+.ruff_cache
+.mypy_cache
+data
+runtime
+tests
+*.log
