@@ -150,6 +150,7 @@ def test_complete_dataset_is_ready_and_report_is_deterministic(tmp_path: Path) -
 
     assert first.ok
     assert first.to_dict() == second.to_dict()
+    assert first.to_dict()["audit_report_schema_version"] == 2
     assert len(first.files) == 4
     assert any(item.recovered for item in first.files)
     assert first.streams["trades/BTCUSDT"].events == 2
@@ -232,7 +233,9 @@ def test_detects_session_scoped_sequence_regression_and_crossed_book(tmp_path: P
     assert report.streams["orderbook/BTCUSDT"].orderbook_sequence_regressions == 1
 
 
-def test_detects_duplicate_trade_and_kline_gap_and_duplicate(tmp_path: Path) -> None:
+def test_detects_duplicate_trade_and_classifies_exact_kline_redelivery(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "raw"
     write_records(
         root,
@@ -268,12 +271,87 @@ def test_detects_duplicate_trade_and_kline_gap_and_duplicate(tmp_path: Path) -> 
     codes = issue_codes(report.errors)
 
     assert "duplicate_trade_id" in codes
-    assert "duplicate_kline" in codes
+    assert "duplicate_kline" not in codes
     kline = report.streams["kline_1/BTCUSDT"]
+    assert kline.duplicate_klines == 1
+    assert kline.kline_revisions == 0
     assert kline.kline_gaps == 1
     assert kline.missing_klines == 2
     assert kline.max_kline_gap_ms == 180_000
     assert "kline_gap" in issue_codes(report.warnings)
+
+
+def test_accepts_causal_kline_revision_and_tracks_latest_payload(tmp_path: Path) -> None:
+    root = tmp_path / "raw"
+    first_payload = {
+        "start": BASE_TS_MS,
+        "interval": "1",
+        "close": "101",
+        "high": "102",
+        "volume": "10",
+        "turnover": "1000",
+    }
+    revised_payload = {
+        "start": BASE_TS_MS,
+        "interval": "1",
+        "close": "102",
+        "high": "103",
+        "volume": "12",
+        "turnover": "1200",
+    }
+    write_records(
+        root,
+        "kline_1",
+        [
+            record("kline_1", first_payload),
+            record(
+                "kline_1",
+                revised_payload,
+                exchange_ts_ms=BASE_TS_MS + 1_000,
+            ),
+            record(
+                "kline_1",
+                dict(revised_payload),
+                exchange_ts_ms=BASE_TS_MS + 2_000,
+            ),
+        ],
+    )
+
+    report = audit_dataset(root, ["BTCUSDT"], ["1"])
+    stream = report.streams["kline_1/BTCUSDT"]
+
+    assert stream.kline_revisions == 1
+    assert stream.duplicate_klines == 1
+    assert "ambiguous_kline_revision" not in issue_codes(report.errors)
+
+
+def test_rejects_different_kline_payloads_with_same_receive_time(tmp_path: Path) -> None:
+    root = tmp_path / "raw"
+    write_records(
+        root,
+        "kline_1",
+        [
+            record(
+                "kline_1",
+                {"start": BASE_TS_MS, "interval": "1", "close": "101"},
+            ),
+            record(
+                "kline_1",
+                {
+                    "start": BASE_TS_MS,
+                    "interval": "1",
+                    "close": "102",
+                    "high": "103",
+                },
+            ),
+        ],
+    )
+
+    report = audit_dataset(root, ["BTCUSDT"], ["1"])
+
+    assert "ambiguous_kline_revision" in issue_codes(report.errors)
+    assert report.streams["kline_1/BTCUSDT"].kline_revisions == 1
+    assert not report.ok
 
 
 def test_invalid_json_path_and_missing_duration_affect_readiness(tmp_path: Path) -> None:

@@ -11,17 +11,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import sqlite3
+import time
 import uuid
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final
 
 RAW_RECORD_SCHEMA_VERSION: Final = 1
-AUDIT_REPORT_SCHEMA_VERSION: Final = 1
+AUDIT_REPORT_SCHEMA_VERSION: Final = 2
+
+LOGGER = logging.getLogger(__name__)
 
 _BASE_KINDS: Final = ("orderbook", "ticker", "trades")
 _FIXED_KLINE_INTERVALS_MS: Final = {
@@ -94,6 +99,7 @@ class StreamAudit:
     duplicate_trade_ids: int
     orderbook_sequence_regressions: int
     duplicate_klines: int
+    kline_revisions: int
     kline_gaps: int
     missing_klines: int
     max_kline_gap_ms: int
@@ -118,6 +124,7 @@ class StreamAudit:
             "duplicate_trade_ids": self.duplicate_trade_ids,
             "orderbook_sequence_regressions": self.orderbook_sequence_regressions,
             "duplicate_klines": self.duplicate_klines,
+            "kline_revisions": self.kline_revisions,
             "kline_gaps": self.kline_gaps,
             "missing_klines": self.missing_klines,
             "max_kline_gap_ms": self.max_kline_gap_ms,
@@ -292,6 +299,7 @@ class _MutableStream:
     duplicate_trade_ids: int = 0
     orderbook_sequence_regressions: int = 0
     duplicate_klines: int = 0
+    kline_revisions: int = 0
     kline_gaps: int = 0
     missing_klines: int = 0
     max_kline_gap_ms: int = 0
@@ -355,6 +363,7 @@ class _MutableStream:
             duplicate_trade_ids=self.duplicate_trade_ids,
             orderbook_sequence_regressions=self.orderbook_sequence_regressions,
             duplicate_klines=self.duplicate_klines,
+            kline_revisions=self.kline_revisions,
             kline_gaps=self.kline_gaps,
             missing_klines=self.missing_klines,
             max_kline_gap_ms=self.max_kline_gap_ms,
@@ -979,20 +988,67 @@ class _AuditState:
                 line=line,
                 stream=stream,
             )
-        try:
+        payload_fingerprint = hashlib.sha256(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).digest()
+        valid_received_at = received_at if _positive_int(received_at) else None
+        existing = self.database.execute(
+            "SELECT received_at_ns, payload_fingerprint "
+            "FROM klines WHERE symbol = ? AND interval = ? AND start_ms = ?",
+            (symbol, interval, start),
+        ).fetchone()
+        if existing is None:
             self.database.execute(
-                "INSERT INTO klines(symbol, interval, start_ms) VALUES (?, ?, ?)",
-                (symbol, interval, start),
+                "INSERT INTO klines("
+                "symbol, interval, start_ms, received_at_ns, payload_fingerprint"
+                ") VALUES (?, ?, ?, ?, ?)",
+                (symbol, interval, start, valid_received_at, payload_fingerprint),
             )
-        except sqlite3.IntegrityError:
-            self.streams[stream].duplicate_klines += 1
-            self.issues.error(
-                "duplicate_kline",
-                f"kline start {start} occurs more than once",
-                path=path,
-                line=line,
-                stream=stream,
-            )
+        else:
+            existing_received_at, existing_fingerprint = existing
+            mutable_stream = self.streams[stream]
+            if existing_fingerprint == payload_fingerprint:
+                mutable_stream.duplicate_klines += 1
+            else:
+                mutable_stream.kline_revisions += 1
+                if (
+                    isinstance(existing_received_at, int)
+                    and isinstance(valid_received_at, int)
+                    and existing_received_at == valid_received_at
+                ):
+                    self.issues.error(
+                        "ambiguous_kline_revision",
+                        "different kline payloads have the same received_at_ns",
+                        path=path,
+                        line=line,
+                        stream=stream,
+                    )
+            if (
+                isinstance(valid_received_at, int)
+                and (
+                    existing_received_at is None
+                    or (
+                        isinstance(existing_received_at, int)
+                        and valid_received_at > existing_received_at
+                    )
+                )
+            ):
+                self.database.execute(
+                    "UPDATE klines SET received_at_ns = ?, payload_fingerprint = ? "
+                    "WHERE symbol = ? AND interval = ? AND start_ms = ?",
+                    (
+                        valid_received_at,
+                        payload_fingerprint,
+                        symbol,
+                        interval,
+                        start,
+                    ),
+                )
 
         step = _kline_interval_ms(interval)
         if step is None:
@@ -1100,6 +1156,12 @@ def _input_fingerprint(files: Sequence[AuditFile]) -> str:
 
 
 def _prepare_database(database: sqlite3.Connection) -> None:
+    # The database is disposable scratch state used only for uniqueness checks.
+    # Crash recovery would add substantial fsync overhead without preserving value.
+    database.execute("PRAGMA journal_mode=OFF")
+    database.execute("PRAGMA synchronous=OFF")
+    database.execute("PRAGMA temp_store=MEMORY")
+    database.execute("PRAGMA cache_size=-65536")
     database.execute(
         "CREATE TABLE trade_ids ("
         "symbol TEXT NOT NULL, trade_id TEXT NOT NULL, PRIMARY KEY(symbol, trade_id)"
@@ -1108,6 +1170,7 @@ def _prepare_database(database: sqlite3.Connection) -> None:
     database.execute(
         "CREATE TABLE klines ("
         "symbol TEXT NOT NULL, interval TEXT NOT NULL, start_ms INTEGER NOT NULL, "
+        "received_at_ns INTEGER, payload_fingerprint BLOB NOT NULL, "
         "PRIMARY KEY(symbol, interval, start_ms)"
         ") WITHOUT ROWID"
     )
@@ -1258,10 +1321,40 @@ def audit_dataset(
                     path=partial_files[0],
                     count=len(partial_files),
                 )
+            total_input_bytes = 0
             for path in completed_paths:
+                with suppress(OSError):
+                    total_input_bytes += path.stat().st_size
+            audit_started = time.monotonic()
+            last_progress = audit_started
+            processed_bytes = 0
+            LOGGER.info(
+                "Auditing %d completed files (%.2f GiB)",
+                len(completed_paths),
+                total_input_bytes / (1024**3),
+            )
+            for index, path in enumerate(completed_paths, start=1):
                 relative_path = _relative(path, root_path)
-                files.append(_audit_file(path, relative_path, state))
-                database.commit()
+                audited_file = _audit_file(path, relative_path, state)
+                files.append(audited_file)
+                processed_bytes += audited_file.bytes
+                now = time.monotonic()
+                if now - last_progress >= 10 or index == len(completed_paths):
+                    elapsed = max(now - audit_started, 0.001)
+                    percent = (
+                        100.0
+                        if total_input_bytes == 0
+                        else min(100.0, processed_bytes / total_input_bytes * 100)
+                    )
+                    LOGGER.info(
+                        "Audit progress: %d/%d files, %.1f%%, %.1f MiB/s",
+                        index,
+                        len(completed_paths),
+                        percent,
+                        processed_bytes / (1024**2) / elapsed,
+                    )
+                    last_progress = now
+            database.commit()
             recovered_count = sum(item.recovered for item in files)
             if recovered_count:
                 state.issues.warning(

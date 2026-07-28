@@ -4,9 +4,18 @@
 нормализацию, JSONL-хранилище, health telemetry и аудит данных. API-ключи, отправка ордеров и
 рабочая торговая модель в эту версию ещё не входят.
 
-Рекомендуемый узел: Ubuntu Server 24.04 LTS x86_64, 4 vCPU, 16 GB RAM, 500 GB NVMe,
-статический IPv4 и не менее 100 Mbit/s. Диск Docker (`/var/lib/docker`) должен находиться на
-том разделе, где доступно основное дисковое пространство.
+Профиль постоянного MVP: Ubuntu Server 24.04 LTS x86_64, 6 vCPU, 10 GB RAM, 100 GB NVMe,
+статический IPv4 и не менее 100 Mbit/s. Collector получает лимит 4 CPU и 6 GB RAM, оставляя
+ресурсы Ubuntu, Docker, health-проверкам и будущим сервисам.
+
+Значения вынесены в `.env`, поэтому тот же Compose-файл можно использовать на более слабой
+или более мощной VM. Виртуальный диск лучше считать расширяемым: CPU и RAM уменьшаются
+настройками VM и `.env`, а существующий диск безопаснее не сжимать. Если позднее потребуется
+меньший диск, создаётся новая VM и переносятся только необходимые данные.
+
+При наблюдаемом объёме около 2,71 GB/сутки диск 100 GB не подходит для бессрочного хранения
+JSONL. Безопасное локальное окно — 14 дней с последующим архивированием; disk guard сохраняет
+не менее 15 GiB свободного места. Текущая версия сама старые данные не удаляет.
 
 ## 1. Войти и проверить сервер
 
@@ -26,8 +35,8 @@ free -h
 df -h / /var/lib/docker 2>/dev/null || df -h /
 ```
 
-Ожидаются Ubuntu 24.04, архитектура `x86_64`, минимум 4 CPU, 16 GB RAM и около 500 GB
-доступного NVMe-диска.
+Ожидаются Ubuntu 24.04, архитектура `x86_64`, 6 CPU, около 10 GB RAM и 100 GB
+NVMe-диска.
 
 ## 2. Обновить ОС и установить базовые пакеты
 
@@ -133,6 +142,8 @@ cd /opt/tradingbot
 
 ```bash
 cd /opt/tradingbot
+cp .env.example .env
+docker compose config --environment
 sudo docker compose config --quiet
 sudo docker compose build --pull
 sudo docker compose run --rm collector python -m tradingbot validate-config
@@ -140,6 +151,25 @@ sudo docker compose run --rm collector python -m tradingbot show-topics
 ```
 
 `show-topics` должен показать 36 тем: шесть пар и по шесть потоков на пару.
+
+Основной профиль в `.env`:
+
+```dotenv
+TRADINGBOT_COLLECTOR_CPUS=4.0
+TRADINGBOT_COLLECTOR_MEMORY=6g
+TRADINGBOT_MIN_FREE_BYTES=16106127360
+```
+
+Для другой VM меняются только эти значения. Например, для узла 4 vCPU / 8 GB:
+
+```dotenv
+TRADINGBOT_COLLECTOR_CPUS=2.5
+TRADINGBOT_COLLECTOR_MEMORY=4g
+TRADINGBOT_MIN_FREE_BYTES=10737418240
+```
+
+После изменения обязательно выполнить `sudo docker compose config --quiet` и
+`sudo docker compose up -d`.
 
 ## 7. Выполнить 90-секундный smoke-test
 
@@ -220,6 +250,10 @@ sudo docker compose run --rm collector python -m tradingbot audit-data \
   --output /app/runtime/24-hour-audit.json
 ```
 
+Audit выводит прогресс примерно раз в 10 секунд. Полная проверка нескольких гигабайт JSONL
+может занять десятки минут; отсутствие итогового JSON до завершения не означает зависание.
+`Ctrl+C` прерывает аудит и даёт код `130`.
+
 Команда должна завершиться с кодом `0`, после чего collector запускается снова:
 
 ```bash
@@ -267,3 +301,4 @@ sudo docker compose ps
 - нет queue overflow и постоянных reconnect;
 - 24-часовой строгий audit вернул код `0`;
 - прогноз дискового объёма приемлем для выбранного retention.
+- для работы дольше 14 дней настроено внешнее архивирование или реализован retention.
