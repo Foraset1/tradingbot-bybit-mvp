@@ -267,6 +267,19 @@ sudo docker compose run --rm --entrypoint python collector -c \
   "print(open('/app/runtime/24-hour-audit.json').read())"
 ```
 
+После успешного strict audit канонический Parquet строится из зафиксированного snapshot:
+
+```bash
+sudo docker compose run --rm --no-deps collector \
+  python -m tradingbot build-dataset \
+  --audit-report /app/runtime/24-hour-audit.json \
+  --root /data/raw \
+  --output-root /data/datasets
+```
+
+Команда повторно проверяет SHA-256 всех входов, показывает прогресс и печатает короткий JSON
+с dataset ID и fingerprint. Полный контракт описан в [`DATASET.md`](DATASET.md).
+
 ## 10. Остановка, обновление и важное предупреждение
 
 Штатная остановка:
@@ -302,3 +315,4 @@ sudo docker compose ps
 - 24-часовой строгий audit вернул код `0`;
 - прогноз дискового объёма приемлем для выбранного retention.
 - для работы дольше 14 дней настроено внешнее архивирование или реализован retention.
+- канонический Parquet dataset построен из неизменного audit manifest.
