@@ -11,7 +11,7 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 COPY config ./config
 
-RUN pip install --no-cache-dir '.[dataset]'
+RUN pip install --no-cache-dir '.[research]'
 
 RUN useradd --create-home --uid 10001 tradingbot \
     && mkdir -p /data/raw /app/runtime \

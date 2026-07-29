@@ -90,6 +90,22 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="Dataset parent directory (defaults to a datasets sibling of storage.root)",
     )
+    research = subparsers.add_parser(
+        "build-research",
+        help="Build causal features and market labels from canonical Parquet",
+    )
+    research.add_argument(
+        "--dataset",
+        type=Path,
+        required=True,
+        help="Canonical dataset directory containing manifest.json",
+    )
+    research.add_argument(
+        "--output-root",
+        type=Path,
+        default=None,
+        help="Research dataset parent directory (defaults to research beside storage.root)",
+    )
     return parser
 
 
@@ -291,6 +307,42 @@ def _run_build_dataset(
     print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
 
 
+def _run_build_research(
+    config: AppConfig,
+    dataset: Path,
+    output_root: Path | None,
+) -> None:
+    try:
+        from tradingbot.research.builder import build_research_dataset
+        from tradingbot.research.contracts import ResearchBuildError
+    except ModuleNotFoundError as exc:
+        if exc.name in {"numpy", "pyarrow"} or (exc.name or "").startswith(
+            ("numpy.", "pyarrow.")
+        ):
+            LOGGER.error(
+                "Research support is not installed; install the project with "
+                "the [research] extra"
+            )
+            raise SystemExit(1) from exc
+        raise
+
+    destination = (
+        config.storage.root.parent / "research"
+        if output_root is None
+        else output_root
+    )
+    try:
+        result = build_research_dataset(
+            canonical_dataset=dataset,
+            output_root=destination,
+            minimum_free_bytes=config.storage.min_free_bytes,
+        )
+    except ResearchBuildError as exc:
+        LOGGER.error("Research build rejected: %s", exc)
+        raise SystemExit(1) from exc
+    print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = _parser()
     args = parser.parse_args(argv)
@@ -326,6 +378,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             config,
             args.audit_report,
             args.root,
+            args.output_root,
+        )
+        return
+    if args.command == "build-research":
+        _run_build_research(
+            config,
+            args.dataset,
             args.output_root,
         )
         return

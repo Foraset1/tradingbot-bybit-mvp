@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tradingbot-bybit"
-version = "0.2.0"
+version = "0.3.0"
 description = "Read-only Bybit market-data collector and research foundation for a local trading model"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -18,8 +18,13 @@ dependencies = [
 dataset = [
     "pyarrow==25.0.0",
 ]
+research = [
+    "numpy==2.5.1",
+    "pyarrow==25.0.0",
+]
 dev = [
     "mypy>=1.14,<2",
+    "numpy==2.5.1",
     "pyarrow==25.0.0",
     "pytest>=8.3,<9",
     "pytest-asyncio>=0.25,<1",

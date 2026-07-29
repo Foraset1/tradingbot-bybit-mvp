@@ -1148,6 +1148,26 @@ def _validate_existing_dataset(
     return _manifest_result(dataset_path, manifest, reused=True)
 
 
+def validate_canonical_dataset(dataset_path: str | Path) -> DatasetBuildResult:
+    """Validate every file in an existing canonical dataset.
+
+    Research stages use this public gate instead of trusting a directory name or
+    scanning arbitrary Parquet files.  It verifies the copied audit report,
+    every Parquet SHA-256 and row count, and both dataset fingerprints.
+    """
+
+    path = Path(dataset_path).expanduser().resolve()
+    if not path.is_dir():
+        raise DatasetBuildError(f"canonical dataset does not exist: {path}")
+    audit_path = path / "source-audit.json"
+    if not audit_path.is_file():
+        raise DatasetBuildError(
+            f"canonical dataset is missing source-audit.json: {path}"
+        )
+    audit = load_audit_input_manifest(audit_path)
+    return _validate_existing_dataset(path, audit, path.name)
+
+
 def _write_manifest(path: Path, payload: dict[str, object]) -> None:
     partial = path.with_suffix(".json.partial")
     rendered = json.dumps(payload, indent=2, sort_keys=True) + "\n"

@@ -1,7 +1,8 @@
 # TradingBot — Bybit futures research foundation
 
-Первая безопасная версия проекта: read-only сборщик публичных рыночных данных Bybit
-для последующего обучения и проверки локальной модели. Эта версия **не принимает торговых
+Безопасная read-only основа проекта: сборщик публичных рыночных данных Bybit,
+канонический Parquet-слой и воспроизводимый набор causal features/market labels для
+последующего обучения и проверки локальной модели. Эта версия **не принимает торговых
 решений, не запрашивает API-ключи и не умеет отправлять ордера**.
 
 Поддерживаемые USDT perpetual пары:
@@ -52,6 +53,10 @@
 - атомарный канонический Parquet dataset с повторной SHA-256 проверкой raw-сегментов;
 - типизированные orderbook, trades, ticker и kline таблицы с ZSTD-сжатием;
 - causal last-write-wins для ревизий закрытых свечей и versioned dataset manifest;
+- минутная UTC decision grid с проверкой `received_at_ns <= decision_at_ns`;
+- признаки цены, волатильности, стакана, order flow, OI/funding и режима BTC;
+- отдельные triple-barrier labels 5/15/30/60 минут без ложного `maker fill`;
+- атомарный versioned research dataset с проверяемыми fingerprint и provenance;
 - строгая проверка конфигурации и заранее зафиксированных risk-инвариантов;
 - контейнерный запуск и автоматические проверки.
 
@@ -76,6 +81,8 @@ tradingbot audit-data
 [`docs/SOAK_TEST.md`](docs/SOAK_TEST.md).
 Построение проверенного Parquet-слоя описано в
 [`docs/DATASET.md`](docs/DATASET.md).
+Контракт causal features и market labels описан в
+[`docs/FEATURES_AND_LABELS.md`](docs/FEATURES_AND_LABELS.md).
 Пошаговое production-развёртывание на Ubuntu Server 24.04 описано в
 [`docs/UBUNTU_DEPLOYMENT.md`](docs/UBUNTU_DEPLOYMENT.md).
 
@@ -165,15 +172,25 @@ tradingbot build-dataset \
   --output-root data/datasets
 ```
 
+После этого research-слой строится только из конкретного канонического dataset:
+
+```bash
+tradingbot build-research \
+  --dataset data/datasets/canonical-v1-<input-fingerprint> \
+  --output-root data/research
+```
+
 ## Границы текущей версии
 
 В проекте пока намеренно нет приватного API Bybit, ключей, плеча, исполнения ордеров,
-торговой стратегии или обещания доходности. Канонический Parquet-слой уже реализован;
-следующая итерация строит признаки, labels и честный walk-forward backtest с комиссиями,
-проскальзыванием стопа и funding. Текущих секундных L50 snapshots и public trades достаточно
-для первой модели движения на 5–60 минут, но недостаточно для точного положения maker-ордера
-в очереди. `NO_FILL` и partial fills будут отдельным этапом simulator с более детальными
-изменениями стакана и калибровкой по demo fills.
+торговой стратегии или обещания доходности. Causal features и рыночные labels уже
+реализованы; следующая итерация — baseline, LightGBM и честный walk-forward backtest с
+комиссиями, проскальзыванием стопа и funding. Один 24-часовой snapshot подтверждает pipeline,
+но категорически недостаточен для вывода о прибыльности или обучения рабочей модели.
+Текущих секундных L50 snapshots и public trades достаточно для первой модели движения на
+5–60 минут, но недостаточно для точного положения maker-ордера в очереди. `NO_FILL` и
+partial fills будут отдельным этапом simulator с более детальными изменениями стакана и
+калибровкой по demo fills.
 
 Это исследовательское ПО, а не финансовая рекомендация. Даже хорошо протестированная
 модель может потерять деньги из-за смены режима рынка, ошибок исполнения или сбоя биржи.
