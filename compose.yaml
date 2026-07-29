@@ -4,9 +4,10 @@ services:
     init: true
     restart: unless-stopped
     environment:
-      TRADINGBOT_CONFIG: /app/config/tradingbot.toml
-      TRADINGBOT_DATA_ROOT: /data/raw
-      TRADINGBOT_HEALTH_PATH: /app/runtime/collector-health.json
+      TRADINGBOT_CONFIG: ${TRADINGBOT_CONFIG:-/app/config/tradingbot.toml}
+      TRADINGBOT_DATA_ROOT: ${TRADINGBOT_DATA_ROOT:-/data/raw}
+      TRADINGBOT_HEALTH_PATH: ${TRADINGBOT_HEALTH_PATH:-/app/runtime/collector-health.json}
+      TRADINGBOT_MIN_FREE_BYTES: ${TRADINGBOT_MIN_FREE_BYTES:-16106127360}
     volumes:
       - market-data:/data
       - collector-runtime:/app/runtime
@@ -16,8 +17,8 @@ services:
     security_opt:
       - no-new-privileges:true
     pids_limit: 128
-    mem_limit: 4g
-    cpus: 2.0
+    mem_limit: ${TRADINGBOT_COLLECTOR_MEMORY:-6g}
+    cpus: ${TRADINGBOT_COLLECTOR_CPUS:-4.0}
     stop_grace_period: 30s
     healthcheck:
       test:

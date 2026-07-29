@@ -29,7 +29,7 @@ segment_seconds = 300
 segment_max_bytes = 134217728
 flush_seconds = 1.0
 queue_maxsize = 100000
-min_free_bytes = 10737418240
+min_free_bytes = 16106127360
 health_path = "runtime/collector-health.json"
 
 [risk]

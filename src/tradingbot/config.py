@@ -93,6 +93,16 @@ def _integer(value: Any, field: str) -> int:
     return int(value)
 
 
+def _environment_integer(name: str, default: Any, field: str) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return _integer(default, field)
+    try:
+        return int(raw_value)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be an integer") from exc
+
+
 def _number(value: Any, field: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ConfigError(f"{field} must be a number")
@@ -268,7 +278,8 @@ def load_config(path: str | Path) -> AppConfig:
             _required(storage_raw, "queue_maxsize", "storage"),
             "storage.queue_maxsize",
         ),
-        min_free_bytes=_integer(
+        min_free_bytes=_environment_integer(
+            "TRADINGBOT_MIN_FREE_BYTES",
             _required(storage_raw, "min_free_bytes", "storage"),
             "storage.min_free_bytes",
         ),

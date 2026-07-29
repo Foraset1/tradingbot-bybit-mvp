@@ -24,7 +24,7 @@ def test_loads_expected_safe_defaults(config_path: Path) -> None:
     assert config.risk.max_hold_seconds == 3600
     assert config.risk.forced_exit_seconds == 3540
     assert config.storage.root == config_path.parents[1] / "data" / "raw"
-    assert config.storage.min_free_bytes == 10 * 1024**3
+    assert config.storage.min_free_bytes == 15 * 1024**3
 
 
 def test_data_root_can_be_overridden(
@@ -43,6 +43,23 @@ def test_health_path_can_be_overridden(
     monkeypatch.setenv("TRADINGBOT_HEALTH_PATH", str(override))
 
     assert load_config(config_path).storage.health_path == override
+
+
+def test_min_free_bytes_can_be_overridden(
+    config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TRADINGBOT_MIN_FREE_BYTES", str(12 * 1024**3))
+
+    assert load_config(config_path).storage.min_free_bytes == 12 * 1024**3
+
+
+def test_rejects_invalid_min_free_bytes_override(
+    config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TRADINGBOT_MIN_FREE_BYTES", "12GB")
+
+    with pytest.raises(ConfigError, match="TRADINGBOT_MIN_FREE_BYTES must be an integer"):
+        load_config(config_path)
 
 
 def test_accepts_risk_values_below_mvp_caps(config_path: Path, tmp_path: Path) -> None:
