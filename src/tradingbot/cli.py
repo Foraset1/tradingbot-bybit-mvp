@@ -68,6 +68,28 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="Optionally write the same JSON report atomically to this path",
     )
+    dataset = subparsers.add_parser(
+        "build-dataset",
+        help="Build deterministic canonical Parquet from a successful strict audit",
+    )
+    dataset.add_argument(
+        "--audit-report",
+        type=Path,
+        required=True,
+        help="Strict audit report v2 used as the immutable source manifest",
+    )
+    dataset.add_argument(
+        "--root",
+        type=Path,
+        default=None,
+        help="Source root override (defaults to dataset_root in the audit report)",
+    )
+    dataset.add_argument(
+        "--output-root",
+        type=Path,
+        default=None,
+        help="Dataset parent directory (defaults to a datasets sibling of storage.root)",
+    )
     return parser
 
 
@@ -233,6 +255,42 @@ def _config_summary(config: AppConfig) -> dict[str, object]:
     }
 
 
+def _run_build_dataset(
+    config: AppConfig,
+    audit_report: Path,
+    root: Path | None,
+    output_root: Path | None,
+) -> None:
+    try:
+        from tradingbot.data.canonical import (
+            DatasetBuildError,
+            build_canonical_dataset,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name == "pyarrow" or (exc.name or "").startswith("pyarrow."):
+            LOGGER.error(
+                "Dataset support is not installed; install the project with "
+                "the [dataset] extra"
+            )
+            raise SystemExit(1) from exc
+        raise
+
+    destination = (
+        config.storage.root.parent / "datasets" if output_root is None else output_root
+    )
+    try:
+        result = build_canonical_dataset(
+            audit_report=audit_report,
+            source_root=root,
+            output_root=destination,
+            minimum_free_bytes=config.storage.min_free_bytes,
+        )
+    except DatasetBuildError as exc:
+        LOGGER.error("Dataset build rejected: %s", exc)
+        raise SystemExit(1) from exc
+    print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = _parser()
     args = parser.parse_args(argv)
@@ -261,6 +319,14 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.minimum_duration_seconds,
             args.strict,
             args.output,
+        )
+        return
+    if args.command == "build-dataset":
+        _run_build_dataset(
+            config,
+            args.audit_report,
+            args.root,
+            args.output_root,
         )
         return
     parser.error(f"Unknown command: {args.command}")

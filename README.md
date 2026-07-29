@@ -49,6 +49,9 @@
 - health по каждой WebSocket-сессии и topic, контроль очереди, задержки и свободного диска;
 - `schema_version`, источник и session ID в каждой новой записи;
 - потоковый audit JSONL с coverage, gap/duplicate checks и SHA-256 fingerprint входов;
+- атомарный канонический Parquet dataset с повторной SHA-256 проверкой raw-сегментов;
+- типизированные orderbook, trades, ticker и kline таблицы с ZSTD-сжатием;
+- causal last-write-wins для ревизий закрытых свечей и versioned dataset manifest;
 - строгая проверка конфигурации и заранее зафиксированных risk-инвариантов;
 - контейнерный запуск и автоматические проверки.
 
@@ -71,6 +74,8 @@ tradingbot audit-data
 `runtime/collector-health.json`. Публичный поток не требует ключей Bybit.
 Порядок одночасовой и 24-часовой проверки описан в
 [`docs/SOAK_TEST.md`](docs/SOAK_TEST.md).
+Построение проверенного Parquet-слоя описано в
+[`docs/DATASET.md`](docs/DATASET.md).
 Пошаговое production-развёртывание на Ubuntu Server 24.04 описано в
 [`docs/UBUNTU_DEPLOYMENT.md`](docs/UBUNTU_DEPLOYMENT.md).
 
@@ -147,15 +152,24 @@ payload (`T` у сделки, `start/end` у свечи, matching-engine timesta
 Bybit может прислать более позднюю версию уже закрытой свечи с тем же
 `symbol/interval/start`, но обновлёнными OHLCV. Raw-слой намеренно сохраняет обе версии.
 Audit report v2 отдельно считает точные повторные доставки в `duplicate_klines` и
-изменившиеся версии в `kline_revisions`. Будущий канонический Parquet-слой выбирает запись с
+изменившиеся версии в `kline_revisions`. Канонический Parquet-слой выбирает запись с
 максимальным `received_at_ns`; разные payload с одинаковым `received_at_ns` остаются ошибкой,
 которую нельзя разрешать автоматически.
+
+После успешного строгого audit:
+
+```bash
+tradingbot build-dataset \
+  --audit-report runtime/24-hour-audit.json \
+  --root data/raw \
+  --output-root data/datasets
+```
 
 ## Границы текущей версии
 
 В проекте пока намеренно нет приватного API Bybit, ключей, плеча, исполнения ордеров,
-торговой стратегии или обещания доходности. Следующий этап — накопить и проверить
-датасет, построить признаки и честный walk-forward backtest с комиссиями,
+торговой стратегии или обещания доходности. Канонический Parquet-слой уже реализован;
+следующая итерация строит признаки, labels и честный walk-forward backtest с комиссиями,
 проскальзыванием стопа и funding. Текущих секундных L50 snapshots и public trades достаточно
 для первой модели движения на 5–60 минут, но недостаточно для точного положения maker-ордера
 в очереди. `NO_FILL` и partial fills будут отдельным этапом simulator с более детальными
