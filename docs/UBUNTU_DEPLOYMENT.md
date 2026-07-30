@@ -280,6 +280,23 @@ sudo docker compose run --rm --no-deps collector \
 Команда повторно проверяет SHA-256 всех входов, показывает прогресс и печатает короткий JSON
 с dataset ID и fingerprint. Полный контракт описан в [`DATASET.md`](DATASET.md).
 
+После проверки `canonical-manifest.json` causal research-слой строится из неизменяемого
+каталога dataset. Для текущего принятого snapshot:
+
+```bash
+sudo docker compose run --rm --no-deps collector \
+  python -m tradingbot build-research \
+  --dataset /data/datasets/canonical-v1-dfd2a620552d79b9 \
+  --output-root /data/research \
+  > /root/research-build-result.json
+```
+
+Collector при этом можно не останавливать: команда читает только уже зафиксированный
+канонический dataset и пишет в отдельный каталог. Результат содержит новый dataset ID,
+fingerprint, число feature/label строк и файлов. Повторный запуск проверяет все SHA-256 и
+возвращает `reused=true`. Контракт описан в
+[`FEATURES_AND_LABELS.md`](FEATURES_AND_LABELS.md).
+
 ## 10. Остановка, обновление и важное предупреждение
 
 Штатная остановка:
@@ -304,7 +321,7 @@ sudo docker compose ps
 После перезагрузки сервера контейнер поднимется автоматически благодаря
 `restart: unless-stopped`.
 
-## Критерий готовности к следующему этапу
+## Критерий готовности research dataset
 
 К построению признаков и labels переходим только когда:
 
@@ -316,3 +333,5 @@ sudo docker compose ps
 - прогноз дискового объёма приемлем для выбранного retention.
 - для работы дольше 14 дней настроено внешнее архивирование или реализован retention.
 - канонический Parquet dataset построен из неизменного audit manifest.
+- causal research dataset построен из принятого canonical manifest;
+- в manifest нет нулевого числа feature/label строк и проверены причины пропусков.

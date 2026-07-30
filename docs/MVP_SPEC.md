@@ -1,7 +1,7 @@
 # MVP specification
 
-Версия: `0.2`
-Статус: collector и канонический dataset, без торговых полномочий
+Версия: `0.3`
+Статус: collector, канонический dataset и causal features/labels, без торговых полномочий
 
 ## 1. Цель
 
@@ -181,7 +181,7 @@ Accuracy не является основной метрикой. Нужны к�
 |---|---|---|
 | 1. Collector | качественные публичные данные и health monitoring — готов | нет |
 | 2a. Canonical dataset | audited JSONL → typed versioned Parquet — реализовано | нет |
-| 2b. Features и labels | causal features, decision grid, market labels | нет |
+| 2b. Features и labels | causal features, decision grid, market labels — реализовано | нет |
 | 3. Research | baseline, LightGBM, walk-forward backtest | нет |
 | 4. Simulator | maker queue/partial fills/slippage/funding | нет |
 | 5. Testnet/paper | state machine, reconciliation, alerts, kill switch | testnet |
@@ -218,4 +218,5 @@ Raw-события не переписываются: при нескольки�
 обязан выбрать причинно последнюю запись по `received_at_ns` и отклонить разные payload с
 одинаковым временем получения. Операционная процедура описана в
 [`SOAK_TEST.md`](SOAK_TEST.md), а контракт Parquet-слоя — в
-[`DATASET.md`](DATASET.md).
+[`DATASET.md`](DATASET.md). Контракт следующего read-only слоя описан в
+[`FEATURES_AND_LABELS.md`](FEATURES_AND_LABELS.md).
