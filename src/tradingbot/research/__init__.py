@@ -6,10 +6,18 @@ from tradingbot.research.contracts import (
     ResearchBuildResult,
     ResearchParameters,
 )
+from tradingbot.research.evaluation_contracts import (
+    EVALUATION_SCHEMA_VERSION,
+    EvaluationError,
+    EvaluationResult,
+)
 
 __all__ = [
     "RESEARCH_SCHEMA_VERSION",
     "ResearchBuildError",
     "ResearchBuildResult",
     "ResearchParameters",
+    "EVALUATION_SCHEMA_VERSION",
+    "EvaluationError",
+    "EvaluationResult",
 ]

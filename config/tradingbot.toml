@@ -43,3 +43,28 @@ max_hold_seconds = 3600
 soft_exit_seconds = 3300
 forced_exit_seconds = 3540
 entry_order_ttl_seconds = 45
+
+[evaluation]
+# Research-only assumptions. Replace fee values with the account's actual tier before
+# interpreting any cost-aware report. Maker fill and queue position are not modeled here.
+horizon_minutes = 60
+embargo_minutes = 60
+minimum_train_days = 30
+test_days = 14
+maximum_folds = 4
+acceptance_minimum_days = 90
+minimum_train_rows = 1000
+minimum_test_rows = 250
+maker_fee_bps = 2.0
+taker_fee_bps = 5.5
+entry_adverse_selection_bps = 1.0
+stop_slippage_bps = 3.0
+timeout_slippage_bps = 1.0
+minimum_expected_net_bps = 1.0
+lightgbm_estimators = 300
+lightgbm_learning_rate = 0.03
+lightgbm_num_leaves = 31
+lightgbm_min_child_samples = 100
+# Leave two vCPUs free for the collector on the current 6-vCPU VM.
+training_threads = 4
+random_seed = 20260730

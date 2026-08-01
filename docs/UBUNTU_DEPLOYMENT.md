@@ -297,6 +297,30 @@ fingerprint, число feature/label строк и файлов. Повторн
 возвращает `reused=true`. Контракт описан в
 [`FEATURES_AND_LABELS.md`](FEATURES_AND_LABELS.md).
 
+Offline baseline/LightGBM/backtest запускается из конкретного неизменяемого research dataset:
+
+```bash
+RESEARCH_DATASET=$(jq -r '.dataset_path' /root/research-build-result.json)
+sudo docker compose run --rm --no-deps collector \
+  python -m tradingbot run-backtest \
+  --research-dataset "$RESEARCH_DATASET" \
+  --output-root /data/evaluations \
+  > /root/backtest-build-result.json
+
+RESULT_PATH=$(jq -r '.experiment_path' /root/backtest-build-result.json)
+sudo docker compose run --rm --no-deps collector \
+  sh -c "cat '$RESULT_PATH/report.json'" \
+  > /root/backtest-report.json
+sudo docker compose run --rm --no-deps collector \
+  sh -c "cat '$RESULT_PATH/manifest.json'" \
+  > /root/backtest-manifest.json
+```
+
+На текущих 72 часах ожидается `data_mode: technical_smoke`: это проверка всего конвейера,
+а не качества или доходности модели. Обычные временные окна требуют минимум 44 дней;
+первый model review — минимум 90 дней и три folds. Подробный контракт находится в
+[`RESEARCH_BACKTEST.md`](RESEARCH_BACKTEST.md).
+
 ## 10. Остановка, обновление и важное предупреждение
 
 Штатная остановка:
@@ -335,3 +359,4 @@ sudo docker compose ps
 - канонический Parquet dataset построен из неизменного audit manifest.
 - causal research dataset построен из принятого canonical manifest;
 - в manifest нет нулевого числа feature/label строк и проверены причины пропусков.
+- technical offline evaluation завершилась, а manifest/report прошли повторную проверку.

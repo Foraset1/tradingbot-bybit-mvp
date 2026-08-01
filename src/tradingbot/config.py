@@ -60,11 +60,36 @@ class RiskConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class EvaluationConfig:
+    horizon_minutes: int
+    embargo_minutes: int
+    minimum_train_days: int
+    test_days: int
+    maximum_folds: int
+    acceptance_minimum_days: int
+    minimum_train_rows: int
+    minimum_test_rows: int
+    maker_fee_bps: float
+    taker_fee_bps: float
+    entry_adverse_selection_bps: float
+    stop_slippage_bps: float
+    timeout_slippage_bps: float
+    minimum_expected_net_bps: float
+    lightgbm_estimators: int
+    lightgbm_learning_rate: float
+    lightgbm_num_leaves: int
+    lightgbm_min_child_samples: int
+    training_threads: int
+    random_seed: int
+
+
+@dataclass(frozen=True, slots=True)
 class AppConfig:
     bybit: BybitConfig
     market: MarketConfig
     storage: StorageConfig
     risk: RiskConfig
+    evaluation: EvaluationConfig
     source_path: Path
 
 
@@ -177,6 +202,49 @@ def _validate_risk(config: RiskConfig) -> None:
         raise ConfigError("entry_order_ttl_seconds must be positive")
 
 
+def _validate_evaluation(config: EvaluationConfig, risk: RiskConfig) -> None:
+    if config.horizon_minutes not in {5, 15, 30, 60}:
+        raise ConfigError("evaluation.horizon_minutes must be one of 5, 15, 30, or 60")
+    if config.horizon_minutes * 60 > risk.max_hold_seconds:
+        raise ConfigError("evaluation horizon cannot exceed risk.max_hold_seconds")
+    if config.embargo_minutes < config.horizon_minutes:
+        raise ConfigError("evaluation.embargo_minutes cannot be shorter than the horizon")
+    positive_integers = {
+        "minimum_train_days": config.minimum_train_days,
+        "test_days": config.test_days,
+        "maximum_folds": config.maximum_folds,
+        "acceptance_minimum_days": config.acceptance_minimum_days,
+        "minimum_train_rows": config.minimum_train_rows,
+        "minimum_test_rows": config.minimum_test_rows,
+        "lightgbm_estimators": config.lightgbm_estimators,
+        "lightgbm_num_leaves": config.lightgbm_num_leaves,
+        "lightgbm_min_child_samples": config.lightgbm_min_child_samples,
+        "training_threads": config.training_threads,
+    }
+    if any(value <= 0 for value in positive_integers.values()):
+        raise ConfigError("evaluation integer limits must be positive")
+    if config.acceptance_minimum_days < (
+        config.minimum_train_days + config.test_days
+    ):
+        raise ConfigError(
+            "evaluation.acceptance_minimum_days must cover train and test windows"
+        )
+    costs = {
+        "maker_fee_bps": config.maker_fee_bps,
+        "taker_fee_bps": config.taker_fee_bps,
+        "entry_adverse_selection_bps": config.entry_adverse_selection_bps,
+        "stop_slippage_bps": config.stop_slippage_bps,
+        "timeout_slippage_bps": config.timeout_slippage_bps,
+        "minimum_expected_net_bps": config.minimum_expected_net_bps,
+    }
+    if any(value < 0 or value > 100 for value in costs.values()):
+        raise ConfigError("evaluation costs and thresholds must be within [0, 100] bps")
+    if not 0 < config.lightgbm_learning_rate <= 1:
+        raise ConfigError("evaluation.lightgbm_learning_rate must be within (0, 1]")
+    if config.random_seed < 0:
+        raise ConfigError("evaluation.random_seed must be non-negative")
+
+
 def load_config(path: str | Path) -> AppConfig:
     source_path = Path(path).expanduser().resolve()
     try:
@@ -192,6 +260,7 @@ def load_config(path: str | Path) -> AppConfig:
     market_raw = _table(raw, "market")
     storage_raw = _table(raw, "storage")
     risk_raw = _table(raw, "risk")
+    evaluation_raw = _table(raw, "evaluation")
 
     default_ws_url = _string(
         _required(bybit_raw, "public_ws_url", "bybit"), "bybit.public_ws_url"
@@ -329,6 +398,91 @@ def load_config(path: str | Path) -> AppConfig:
         ),
     )
 
+    evaluation = EvaluationConfig(
+        horizon_minutes=_integer(
+            _required(evaluation_raw, "horizon_minutes", "evaluation"),
+            "evaluation.horizon_minutes",
+        ),
+        embargo_minutes=_integer(
+            _required(evaluation_raw, "embargo_minutes", "evaluation"),
+            "evaluation.embargo_minutes",
+        ),
+        minimum_train_days=_integer(
+            _required(evaluation_raw, "minimum_train_days", "evaluation"),
+            "evaluation.minimum_train_days",
+        ),
+        test_days=_integer(
+            _required(evaluation_raw, "test_days", "evaluation"),
+            "evaluation.test_days",
+        ),
+        maximum_folds=_integer(
+            _required(evaluation_raw, "maximum_folds", "evaluation"),
+            "evaluation.maximum_folds",
+        ),
+        acceptance_minimum_days=_integer(
+            _required(evaluation_raw, "acceptance_minimum_days", "evaluation"),
+            "evaluation.acceptance_minimum_days",
+        ),
+        minimum_train_rows=_integer(
+            _required(evaluation_raw, "minimum_train_rows", "evaluation"),
+            "evaluation.minimum_train_rows",
+        ),
+        minimum_test_rows=_integer(
+            _required(evaluation_raw, "minimum_test_rows", "evaluation"),
+            "evaluation.minimum_test_rows",
+        ),
+        maker_fee_bps=_number(
+            _required(evaluation_raw, "maker_fee_bps", "evaluation"),
+            "evaluation.maker_fee_bps",
+        ),
+        taker_fee_bps=_number(
+            _required(evaluation_raw, "taker_fee_bps", "evaluation"),
+            "evaluation.taker_fee_bps",
+        ),
+        entry_adverse_selection_bps=_number(
+            _required(
+                evaluation_raw, "entry_adverse_selection_bps", "evaluation"
+            ),
+            "evaluation.entry_adverse_selection_bps",
+        ),
+        stop_slippage_bps=_number(
+            _required(evaluation_raw, "stop_slippage_bps", "evaluation"),
+            "evaluation.stop_slippage_bps",
+        ),
+        timeout_slippage_bps=_number(
+            _required(evaluation_raw, "timeout_slippage_bps", "evaluation"),
+            "evaluation.timeout_slippage_bps",
+        ),
+        minimum_expected_net_bps=_number(
+            _required(evaluation_raw, "minimum_expected_net_bps", "evaluation"),
+            "evaluation.minimum_expected_net_bps",
+        ),
+        lightgbm_estimators=_integer(
+            _required(evaluation_raw, "lightgbm_estimators", "evaluation"),
+            "evaluation.lightgbm_estimators",
+        ),
+        lightgbm_learning_rate=_number(
+            _required(evaluation_raw, "lightgbm_learning_rate", "evaluation"),
+            "evaluation.lightgbm_learning_rate",
+        ),
+        lightgbm_num_leaves=_integer(
+            _required(evaluation_raw, "lightgbm_num_leaves", "evaluation"),
+            "evaluation.lightgbm_num_leaves",
+        ),
+        lightgbm_min_child_samples=_integer(
+            _required(evaluation_raw, "lightgbm_min_child_samples", "evaluation"),
+            "evaluation.lightgbm_min_child_samples",
+        ),
+        training_threads=_integer(
+            _required(evaluation_raw, "training_threads", "evaluation"),
+            "evaluation.training_threads",
+        ),
+        random_seed=_integer(
+            _required(evaluation_raw, "random_seed", "evaluation"),
+            "evaluation.random_seed",
+        ),
+    )
+
     _validate_ws_url(bybit.public_ws_url)
     _validate_symbols(bybit.symbols)
     if bybit.heartbeat_seconds <= 0:
@@ -364,11 +518,13 @@ def load_config(path: str | Path) -> AppConfig:
             "Storage flush interval, queue size, and minimum free bytes must be positive"
         )
     _validate_risk(risk)
+    _validate_evaluation(evaluation, risk)
 
     return AppConfig(
         bybit=bybit,
         market=market,
         storage=storage,
         risk=risk,
+        evaluation=evaluation,
         source_path=source_path,
     )

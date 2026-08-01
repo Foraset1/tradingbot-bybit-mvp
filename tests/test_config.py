@@ -25,6 +25,10 @@ def test_loads_expected_safe_defaults(config_path: Path) -> None:
     assert config.risk.forced_exit_seconds == 3540
     assert config.storage.root == config_path.parents[1] / "data" / "raw"
     assert config.storage.min_free_bytes == 15 * 1024**3
+    assert config.evaluation.horizon_minutes == 60
+    assert config.evaluation.embargo_minutes == 60
+    assert config.evaluation.acceptance_minimum_days == 90
+    assert config.evaluation.training_threads == 4
 
 
 def test_data_root_can_be_overridden(
@@ -74,6 +78,7 @@ def test_accepts_risk_values_below_mvp_caps(config_path: Path, tmp_path: Path) -
         "max_hold_seconds = 3600": "max_hold_seconds = 3500",
         "soft_exit_seconds = 3300": "soft_exit_seconds = 3200",
         "forced_exit_seconds = 3540": "forced_exit_seconds = 3400",
+        "horizon_minutes = 60": "horizon_minutes = 30",
     }
     for old, new in replacements.items():
         assert old in source
@@ -137,6 +142,21 @@ def test_accepts_risk_values_below_mvp_caps(config_path: Path, tmp_path: Path) -
             "target_risk_fraction = 0.005",
             "target_risk_fraction = nan",
             "must be finite",
+        ),
+        (
+            "embargo_minutes = 60",
+            "embargo_minutes = 30",
+            "cannot be shorter",
+        ),
+        (
+            "maker_fee_bps = 2.0",
+            "maker_fee_bps = -1.0",
+            r"within \[0, 100\]",
+        ),
+        (
+            "training_threads = 4",
+            "training_threads = 0",
+            "integer limits must be positive",
         ),
     ],
 )
