@@ -284,11 +284,16 @@ sudo docker compose run --rm --no-deps collector \
 каталога dataset. Для текущего принятого snapshot:
 
 ```bash
+REPORT_DIR=/home/foraset1/tradingbot-reports
+sudo install -d -m 0750 -o foraset1 -g foraset1 "$REPORT_DIR"
+umask 027
+
 sudo docker compose run --rm --no-deps collector \
   python -m tradingbot build-research \
   --dataset /data/datasets/canonical-v1-dfd2a620552d79b9 \
   --output-root /data/research \
-  > /root/research-build-result.json
+  > "$REPORT_DIR/research-build-result.json"
+sudo chown foraset1:foraset1 "$REPORT_DIR/research-build-result.json"
 ```
 
 Collector при этом можно не останавливать: команда читает только уже зафиксированный
@@ -296,6 +301,32 @@ Collector при этом можно не останавливать: коман
 fingerprint, число feature/label строк и файлов. Повторный запуск проверяет все SHA-256 и
 возвращает `reused=true`. Контракт описан в
 [`FEATURES_AND_LABELS.md`](FEATURES_AND_LABELS.md).
+
+Offline baseline/LightGBM/backtest запускается из конкретного неизменяемого research dataset:
+
+```bash
+REPORT_DIR=/home/foraset1/tradingbot-reports
+RESEARCH_DATASET=$(jq -r '.dataset_path' "$REPORT_DIR/research-build-result.json")
+sudo docker compose run --rm --no-deps collector \
+  python -m tradingbot run-backtest \
+  --research-dataset "$RESEARCH_DATASET" \
+  --output-root /data/evaluations \
+  > "$REPORT_DIR/backtest-build-result.json"
+
+RESULT_PATH=$(jq -r '.experiment_path' "$REPORT_DIR/backtest-build-result.json")
+sudo docker compose run --rm --no-deps collector \
+  sh -c "cat '$RESULT_PATH/report.json'" \
+  > "$REPORT_DIR/backtest-report.json"
+sudo docker compose run --rm --no-deps collector \
+  sh -c "cat '$RESULT_PATH/manifest.json'" \
+  > "$REPORT_DIR/backtest-manifest.json"
+sudo chown foraset1:foraset1 "$REPORT_DIR"/*.json
+```
+
+На текущих 72 часах ожидается `data_mode: technical_smoke`: это проверка всего конвейера,
+а не качества или доходности модели. Обычные временные окна требуют минимум 44 дней;
+первый model review — минимум 90 дней и три folds. Подробный контракт находится в
+[`RESEARCH_BACKTEST.md`](RESEARCH_BACKTEST.md).
 
 ## 10. Остановка, обновление и важное предупреждение
 
@@ -335,3 +366,4 @@ sudo docker compose ps
 - канонический Parquet dataset построен из неизменного audit manifest.
 - causal research dataset построен из принятого canonical manifest;
 - в manifest нет нулевого числа feature/label строк и проверены причины пропусков.
+- technical offline evaluation завершилась, а manifest/report прошли повторную проверку.

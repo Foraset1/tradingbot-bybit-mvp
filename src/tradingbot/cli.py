@@ -106,6 +106,22 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="Research dataset parent directory (defaults to research beside storage.root)",
     )
+    evaluation = subparsers.add_parser(
+        "run-backtest",
+        help="Run causal baselines, LightGBM, and a conditional-entry market backtest",
+    )
+    evaluation.add_argument(
+        "--research-dataset",
+        type=Path,
+        required=True,
+        help="Verified research dataset directory containing manifest.json",
+    )
+    evaluation.add_argument(
+        "--output-root",
+        type=Path,
+        default=None,
+        help="Evaluation parent directory (defaults to evaluations beside storage.root)",
+    )
     return parser
 
 
@@ -267,6 +283,14 @@ def _config_summary(config: AppConfig) -> dict[str, object]:
             "max_open_positions": config.risk.max_open_positions,
             "max_hold_seconds": config.risk.max_hold_seconds,
         },
+        "evaluation": {
+            "horizon_minutes": config.evaluation.horizon_minutes,
+            "embargo_minutes": config.evaluation.embargo_minutes,
+            "minimum_train_days": config.evaluation.minimum_train_days,
+            "test_days": config.evaluation.test_days,
+            "acceptance_minimum_days": config.evaluation.acceptance_minimum_days,
+            "training_threads": config.evaluation.training_threads,
+        },
         "mode": "public-read-only",
     }
 
@@ -343,6 +367,43 @@ def _run_build_research(
     print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
 
 
+def _run_backtest(
+    config: AppConfig,
+    research_dataset: Path,
+    output_root: Path | None,
+) -> None:
+    try:
+        from tradingbot.research.evaluation_contracts import EvaluationError
+        from tradingbot.research.evaluator import run_offline_evaluation
+    except ModuleNotFoundError as exc:
+        if exc.name in {"lightgbm", "numpy", "pyarrow", "sklearn"} or (
+            exc.name or ""
+        ).startswith(("lightgbm.", "numpy.", "pyarrow.", "sklearn.")):
+            LOGGER.error(
+                "Backtest support is not installed; install the project with "
+                "the [research] extra"
+            )
+            raise SystemExit(1) from exc
+        raise
+
+    destination = (
+        config.storage.root.parent / "evaluations"
+        if output_root is None
+        else output_root
+    )
+    try:
+        result = run_offline_evaluation(
+            research_dataset=research_dataset,
+            output_root=destination,
+            config=config,
+            minimum_free_bytes=config.storage.min_free_bytes,
+        )
+    except EvaluationError as exc:
+        LOGGER.error("Offline evaluation rejected: %s", exc)
+        raise SystemExit(1) from exc
+    print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = _parser()
     args = parser.parse_args(argv)
@@ -387,5 +448,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.dataset,
             args.output_root,
         )
+        return
+    if args.command == "run-backtest":
+        _run_backtest(config, args.research_dataset, args.output_root)
         return
     parser.error(f"Unknown command: {args.command}")

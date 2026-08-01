@@ -1,9 +1,9 @@
 # TradingBot — Bybit futures research foundation
 
 Безопасная read-only основа проекта: сборщик публичных рыночных данных Bybit,
-канонический Parquet-слой и воспроизводимый набор causal features/market labels для
-последующего обучения и проверки локальной модели. Эта версия **не принимает торговых
-решений, не запрашивает API-ключи и не умеет отправлять ордера**.
+канонический Parquet-слой, воспроизводимый набор causal features/market labels и offline
+оценка локальной модели. Эта версия **не принимает live-решений, не запрашивает API-ключи
+и не умеет отправлять ордера**.
 
 Поддерживаемые USDT perpetual пары:
 
@@ -57,6 +57,11 @@
 - признаки цены, волатильности, стакана, order flow, OI/funding и режима BTC;
 - отдельные triple-barrier labels 5/15/30/60 минут без ложного `maker fill`;
 - атомарный versioned research dataset с проверяемыми fingerprint и provenance;
+- purged walk-forward split с 60-минутным embargo и явным режимом короткого smoke-test;
+- class-prior и logistic baseline, а также детерминированный глобальный LightGBM;
+- backtest, выбирающий одну пару/сторону и учитывающий комиссии, slippage, funding,
+  лимит номинала, одну позицию и rolling 24h loss gate;
+- versioned evaluation report, модели и Parquet-ledger сделок с SHA-256 проверкой;
 - строгая проверка конфигурации и заранее зафиксированных risk-инвариантов;
 - контейнерный запуск и автоматические проверки.
 
@@ -83,6 +88,8 @@ tradingbot audit-data
 [`docs/DATASET.md`](docs/DATASET.md).
 Контракт causal features и market labels описан в
 [`docs/FEATURES_AND_LABELS.md`](docs/FEATURES_AND_LABELS.md).
+Запуск baseline, LightGBM и cost-aware backtest описан в
+[`docs/RESEARCH_BACKTEST.md`](docs/RESEARCH_BACKTEST.md).
 Пошаговое production-развёртывание на Ubuntu Server 24.04 описано в
 [`docs/UBUNTU_DEPLOYMENT.md`](docs/UBUNTU_DEPLOYMENT.md).
 
@@ -180,13 +187,21 @@ tradingbot build-research \
   --output-root data/research
 ```
 
+Техническая offline-оценка строится из неизменяемого research dataset:
+
+```bash
+tradingbot run-backtest \
+  --research-dataset data/research/research-v1-<input-fingerprint> \
+  --output-root data/evaluations
+```
+
 ## Границы текущей версии
 
 В проекте пока намеренно нет приватного API Bybit, ключей, плеча, исполнения ордеров,
-торговой стратегии или обещания доходности. Causal features и рыночные labels уже
-реализованы; следующая итерация — baseline, LightGBM и честный walk-forward backtest с
-комиссиями, проскальзыванием стопа и funding. Один 24-часовой snapshot подтверждает pipeline,
-но категорически недостаточен для вывода о прибыльности или обучения рабочей модели.
+торговой стратегии или обещания доходности. Baseline, LightGBM и purged walk-forward backtest
+уже реализованы. История короче 44 дней запускает только технический 70/30 smoke-test;
+первый осмысленный обзор модели разрешён после 90 дней и минимум трёх временных folds.
+Даже тогда нельзя делать вывод о реальной доходности до отдельного maker execution simulator.
 Текущих секундных L50 snapshots и public trades достаточно для первой модели движения на
 5–60 минут, но недостаточно для точного положения maker-ордера в очереди. `NO_FILL` и
 partial fills будут отдельным этапом simulator с более детальными изменениями стакана и
