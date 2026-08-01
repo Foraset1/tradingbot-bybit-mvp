@@ -284,11 +284,16 @@ sudo docker compose run --rm --no-deps collector \
 каталога dataset. Для текущего принятого snapshot:
 
 ```bash
+REPORT_DIR=/home/foraset1/tradingbot-reports
+sudo install -d -m 0750 -o foraset1 -g foraset1 "$REPORT_DIR"
+umask 027
+
 sudo docker compose run --rm --no-deps collector \
   python -m tradingbot build-research \
   --dataset /data/datasets/canonical-v1-dfd2a620552d79b9 \
   --output-root /data/research \
-  > /root/research-build-result.json
+  > "$REPORT_DIR/research-build-result.json"
+sudo chown foraset1:foraset1 "$REPORT_DIR/research-build-result.json"
 ```
 
 Collector при этом можно не останавливать: команда читает только уже зафиксированный
@@ -300,20 +305,22 @@ fingerprint, число feature/label строк и файлов. Повторн
 Offline baseline/LightGBM/backtest запускается из конкретного неизменяемого research dataset:
 
 ```bash
-RESEARCH_DATASET=$(jq -r '.dataset_path' /root/research-build-result.json)
+REPORT_DIR=/home/foraset1/tradingbot-reports
+RESEARCH_DATASET=$(jq -r '.dataset_path' "$REPORT_DIR/research-build-result.json")
 sudo docker compose run --rm --no-deps collector \
   python -m tradingbot run-backtest \
   --research-dataset "$RESEARCH_DATASET" \
   --output-root /data/evaluations \
-  > /root/backtest-build-result.json
+  > "$REPORT_DIR/backtest-build-result.json"
 
-RESULT_PATH=$(jq -r '.experiment_path' /root/backtest-build-result.json)
+RESULT_PATH=$(jq -r '.experiment_path' "$REPORT_DIR/backtest-build-result.json")
 sudo docker compose run --rm --no-deps collector \
   sh -c "cat '$RESULT_PATH/report.json'" \
-  > /root/backtest-report.json
+  > "$REPORT_DIR/backtest-report.json"
 sudo docker compose run --rm --no-deps collector \
   sh -c "cat '$RESULT_PATH/manifest.json'" \
-  > /root/backtest-manifest.json
+  > "$REPORT_DIR/backtest-manifest.json"
+sudo chown foraset1:foraset1 "$REPORT_DIR"/*.json
 ```
 
 На текущих 72 часах ожидается `data_mode: technical_smoke`: это проверка всего конвейера,

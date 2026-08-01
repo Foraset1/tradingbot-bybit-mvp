@@ -37,20 +37,28 @@ tradingbot run-backtest \
 ```bash
 cd /opt/tradingbot
 
-RESEARCH_DATASET=$(jq -r '.dataset_path' /root/research-build-result.json)
+REPORT_DIR=/home/foraset1/tradingbot-reports
+sudo install -d -m 0750 -o foraset1 -g foraset1 "$REPORT_DIR"
+umask 027
+
+RESEARCH_DATASET=$(
+  sudo docker compose run --rm --no-deps \
+    --entrypoint python collector \
+    -c "from pathlib import Path; paths=list(Path('/data/research').glob('research-v1-*')); assert paths, 'research dataset not found'; print(max(paths, key=lambda p: p.stat().st_mtime_ns))"
+)
 sudo docker compose run --rm --no-deps collector \
   python -m tradingbot run-backtest \
   --research-dataset "$RESEARCH_DATASET" \
   --output-root /data/evaluations \
-  > /root/backtest-build-result.json
+  > "$REPORT_DIR/backtest-build-result.json"
 
-jq . /root/backtest-build-result.json
+jq . "$REPORT_DIR/backtest-build-result.json"
+sudo chown foraset1:foraset1 "$REPORT_DIR/backtest-build-result.json"
 ```
 
-Если `/root/research-build-result.json` относится к старому snapshot, это нормально для
-первого технического smoke-test. Для нового 72-часового snapshot сначала нужно повторить
-strict audit, `build-dataset` и `build-research`; нельзя дописывать данные в уже созданный
-versioned dataset.
+Для первого технического smoke-test можно использовать уже созданный snapshot. Для нового
+72-часового snapshot сначала нужно повторить strict audit, `build-dataset` и
+`build-research`; нельзя дописывать данные в уже созданный versioned dataset.
 
 ## Результаты
 
@@ -80,13 +88,17 @@ versioned dataset.
 Чтобы скопировать небольшие JSON-файлы на host после выполнения команды:
 
 ```bash
-RESULT_PATH=$(jq -r '.experiment_path' /root/backtest-build-result.json)
+REPORT_DIR=/home/foraset1/tradingbot-reports
+RESULT_PATH=$(jq -r '.experiment_path' "$REPORT_DIR/backtest-build-result.json")
 sudo docker compose run --rm --no-deps collector \
   sh -c "cat '$RESULT_PATH/report.json'" \
-  > /root/backtest-report.json
+  > "$REPORT_DIR/backtest-report.json"
 sudo docker compose run --rm --no-deps collector \
   sh -c "cat '$RESULT_PATH/manifest.json'" \
-  > /root/backtest-manifest.json
+  > "$REPORT_DIR/backtest-manifest.json"
+sudo chown foraset1:foraset1 \
+  "$REPORT_DIR/backtest-report.json" \
+  "$REPORT_DIR/backtest-manifest.json"
 ```
 
 ## Как трактовать короткую историю
@@ -127,8 +139,8 @@ sudo docker compose run --rm --no-deps collector \
 
 Достаточно трёх небольших файлов:
 
-- `/root/backtest-build-result.json`;
-- `/root/backtest-report.json`;
-- `/root/backtest-manifest.json`.
+- `/home/foraset1/tradingbot-reports/backtest-build-result.json`;
+- `/home/foraset1/tradingbot-reports/backtest-report.json`;
+- `/home/foraset1/tradingbot-reports/backtest-manifest.json`.
 
 Parquet со сделками и файлы моделей передавать не нужно, пока JSON-аудит не выявит проблему.
