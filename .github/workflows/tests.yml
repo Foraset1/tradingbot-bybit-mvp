@@ -17,3 +17,8 @@ jobs:
       - run: python -m ruff check .
       - run: python -m mypy
       - run: python -m pytest
+      - run: docker build --tag tradingbot-ci .
+      - run: >-
+          docker run --rm --entrypoint python tradingbot-ci -c
+          "import lightgbm, pyarrow, sklearn;
+          print(lightgbm.__version__, pyarrow.__version__, sklearn.__version__)"
