@@ -8,6 +8,8 @@ services:
       TRADINGBOT_DATA_ROOT: ${TRADINGBOT_DATA_ROOT:-/data/raw}
       TRADINGBOT_HEALTH_PATH: ${TRADINGBOT_HEALTH_PATH:-/app/runtime/collector-health.json}
       TRADINGBOT_MIN_FREE_BYTES: ${TRADINGBOT_MIN_FREE_BYTES:-16106127360}
+      TRADINGBOT_ARCHIVE_ROOT: ${TRADINGBOT_ARCHIVE_ROOT:-/data/archive}
+      TRADINGBOT_RAW_RETENTION_DAYS: ${TRADINGBOT_RAW_RETENTION_DAYS:-7}
     volumes:
       - market-data:/data
       - collector-runtime:/app/runtime

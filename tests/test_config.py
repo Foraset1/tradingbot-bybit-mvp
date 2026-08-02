@@ -25,6 +25,9 @@ def test_loads_expected_safe_defaults(config_path: Path) -> None:
     assert config.risk.forced_exit_seconds == 3540
     assert config.storage.root == config_path.parents[1] / "data" / "raw"
     assert config.storage.min_free_bytes == 15 * 1024**3
+    assert config.archive.root == config_path.parents[1] / "data" / "archive"
+    assert config.archive.raw_retention_days == 7
+    assert config.archive.daily_minimum_duration_seconds == 82_800
     assert config.evaluation.horizon_minutes == 60
     assert config.evaluation.embargo_minutes == 60
     assert config.evaluation.acceptance_minimum_days == 90
@@ -55,6 +58,19 @@ def test_min_free_bytes_can_be_overridden(
     monkeypatch.setenv("TRADINGBOT_MIN_FREE_BYTES", str(12 * 1024**3))
 
     assert load_config(config_path).storage.min_free_bytes == 12 * 1024**3
+
+
+def test_archive_policy_can_be_overridden(
+    config_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = tmp_path / "daily-archive"
+    monkeypatch.setenv("TRADINGBOT_ARCHIVE_ROOT", str(archive))
+    monkeypatch.setenv("TRADINGBOT_RAW_RETENTION_DAYS", "5")
+
+    config = load_config(config_path)
+
+    assert config.archive.root == archive
+    assert config.archive.raw_retention_days == 5
 
 
 def test_rejects_invalid_min_free_bytes_override(
@@ -157,6 +173,11 @@ def test_accepts_risk_values_below_mvp_caps(config_path: Path, tmp_path: Path) -
             "training_threads = 4",
             "training_threads = 0",
             "integer limits must be positive",
+        ),
+        (
+            "raw_retention_days = 7",
+            "raw_retention_days = 0",
+            "raw_retention_days must be positive",
         ),
     ],
 )

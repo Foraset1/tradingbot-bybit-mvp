@@ -47,6 +47,13 @@ class StorageConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ArchiveConfig:
+    root: Path
+    raw_retention_days: int
+    daily_minimum_duration_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
 class RiskConfig:
     max_notional_fraction: float
     target_risk_fraction: float
@@ -88,6 +95,7 @@ class AppConfig:
     bybit: BybitConfig
     market: MarketConfig
     storage: StorageConfig
+    archive: ArchiveConfig
     risk: RiskConfig
     evaluation: EvaluationConfig
     source_path: Path
@@ -259,6 +267,7 @@ def load_config(path: str | Path) -> AppConfig:
     bybit_raw = _table(raw, "bybit")
     market_raw = _table(raw, "market")
     storage_raw = _table(raw, "storage")
+    archive_raw = _table(raw, "archive")
     risk_raw = _table(raw, "risk")
     evaluation_raw = _table(raw, "evaluation")
 
@@ -356,6 +365,26 @@ def load_config(path: str | Path) -> AppConfig:
             health_path_value,
             "storage.health_path",
             project_root,
+        ),
+    )
+
+    archive_root_value = os.getenv(
+        "TRADINGBOT_ARCHIVE_ROOT", str(storage.root.parent / "archive")
+    )
+    archive = ArchiveConfig(
+        root=_resolve_path(archive_root_value, "archive.root", project_root),
+        raw_retention_days=_environment_integer(
+            "TRADINGBOT_RAW_RETENTION_DAYS",
+            _required(archive_raw, "raw_retention_days", "archive"),
+            "archive.raw_retention_days",
+        ),
+        daily_minimum_duration_seconds=_number(
+            _required(
+                archive_raw,
+                "daily_minimum_duration_seconds",
+                "archive",
+            ),
+            "archive.daily_minimum_duration_seconds",
         ),
     )
 
@@ -517,6 +546,18 @@ def load_config(path: str | Path) -> AppConfig:
         raise ConfigError(
             "Storage flush interval, queue size, and minimum free bytes must be positive"
         )
+    if archive.raw_retention_days <= 0:
+        raise ConfigError("archive.raw_retention_days must be positive")
+    if not 0 <= archive.daily_minimum_duration_seconds < 86_400:
+        raise ConfigError(
+            "archive.daily_minimum_duration_seconds must be within [0, 86400)"
+        )
+    if (
+        archive.root == storage.root
+        or archive.root.is_relative_to(storage.root)
+        or storage.root.is_relative_to(archive.root)
+    ):
+        raise ConfigError("archive.root and storage.root must not overlap")
     _validate_risk(risk)
     _validate_evaluation(evaluation, risk)
 
@@ -524,6 +565,7 @@ def load_config(path: str | Path) -> AppConfig:
         bybit=bybit,
         market=market,
         storage=storage,
+        archive=archive,
         risk=risk,
         evaluation=evaluation,
         source_path=source_path,

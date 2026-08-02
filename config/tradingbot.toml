@@ -32,6 +32,12 @@ queue_maxsize = 100000
 min_free_bytes = 16106127360
 health_path = "runtime/collector-health.json"
 
+[archive]
+# Keep raw JSONL only as a short replay/debug window.  Daily verified Parquet is
+# retained separately and is normally about one tenth of the raw size.
+raw_retention_days = 7
+daily_minimum_duration_seconds = 82800.0
+
 [risk]
 # These values are documented now and will only be used by a later trading service.
 max_notional_fraction = 0.05
