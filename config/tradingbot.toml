@@ -38,6 +38,20 @@ health_path = "runtime/collector-health.json"
 raw_retention_days = 7
 daily_minimum_duration_seconds = 82800.0
 
+[history]
+# Official Bybit daily public-trade archives are streamed into compact 1-second
+# and 1-minute trade bars. Compressed CSV files and individual ticks are not kept.
+root = "data/history"
+public_base_url = "https://public.bybit.com/trading"
+# Offline archives do not contain our receive timestamp. This conservative delay
+# defines when a derived bar is considered available to the research pipeline.
+assumed_latency_ms = 1000
+request_timeout_seconds = 60
+download_attempts = 3
+# Do not manufacture candles for minutes with no public trades. Up to five sparse
+# minutes are retained as explicit gaps; a larger daily gap rejects the archive.
+maximum_missing_minutes = 5
+
 [risk]
 # These values are documented now and will only be used by a later trading service.
 max_notional_fraction = 0.05

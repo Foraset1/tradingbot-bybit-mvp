@@ -90,6 +90,8 @@ tradingbot audit-data
 [`docs/DATASET.md`](docs/DATASET.md).
 Ежедневный архив, каталог и проверка retention описаны в
 [`docs/DAILY_ARCHIVE.md`](docs/DAILY_ARCHIVE.md).
+Bootstrap бесплатной официальной истории сделок Bybit описан в
+[`docs/HISTORICAL_BOOTSTRAP.md`](docs/HISTORICAL_BOOTSTRAP.md).
 Контракт causal features и market labels описан в
 [`docs/FEATURES_AND_LABELS.md`](docs/FEATURES_AND_LABELS.md).
 Запуск baseline, LightGBM и cost-aware backtest описан в
@@ -128,7 +130,20 @@ Compose-файла. Данные и health-файл сохраняются в и
 2,71 GB/сутки до учёта рыночного режима. На диске 100 GB целевое окно raw — 7 дней;
 завершённые UTC-дни сохраняются в существенно меньшем Parquet-архиве. Disk guard оставляет
 минимум 15 GiB свободного места и останавливает сбор вместо заполнения файловой системы.
-Версия 0.5.0 строит только проверяемый dry-run очистки и ещё не удаляет файлы.
+Версия 0.6.0 строит только проверяемый dry-run очистки и ещё не удаляет файлы.
+
+Официальные суточные trade archives можно потоково преобразовать в отдельный компактный
+профиль `price_futures_v1` без хранения gzip и отдельных тиков:
+
+```bash
+tradingbot import-history \
+  --from-date 2026-08-01 \
+  --to-date 2026-08-02
+```
+
+Команда строит 1s/1m trade-bars и проверяемый `/data/history/catalog.json`. Она не создаёт
+стакан, ticker, funding или open interest и пока не является входом существующего
+microstructure `build-research`.
 
 ## Формат данных
 
