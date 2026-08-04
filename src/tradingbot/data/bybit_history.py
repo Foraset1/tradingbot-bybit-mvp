@@ -694,6 +694,15 @@ def _check_disk(path: Path, minimum_free_bytes: int, additional_bytes: int = 0) 
         raise HistoryImportError(f"insufficient disk space: {free} bytes free, {required} required")
 
 
+def _log_history_progress(partition_date: str, symbol: str, source_rows: int) -> None:
+    LOGGER.info(
+        "History progress %s %s: %s source trades",
+        partition_date,
+        symbol,
+        f"{source_rows:,}",
+    )
+
+
 def _history_file(
     *, path: Path, relative_path: str, kind: str, symbol: str, partition_date: str, rows: int
 ) -> HistoryFile:
@@ -842,12 +851,7 @@ def _process_archive(
                 previous_trade_id = trade_id
                 if source_rows % 250_000 == 0:
                     _check_disk(temp_symbol_dir, minimum_free_bytes)
-                    LOGGER.info(
-                        "History progress %s %s: %,d source trades",
-                        partition_date,
-                        symbol,
-                        source_rows,
-                    )
+                    _log_history_progress(partition_date, symbol, source_rows)
 
         if source_rows == 0 or first_event_ns is None or previous_event_ns is None:
             raise HistoryImportError(f"archive contains no trades: {url}")

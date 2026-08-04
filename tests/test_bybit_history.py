@@ -4,6 +4,7 @@ import gzip
 import hashlib
 import io
 import json
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -58,6 +59,17 @@ def _install_archive(monkeypatch: pytest.MonkeyPatch, payload: bytes) -> list[st
 
     monkeypatch.setattr(bybit_history, "_open_url", fake_open)
     return opened
+
+
+def test_history_progress_logging_formats_large_row_counts(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.INFO, logger=bybit_history.LOGGER.name):
+        bybit_history._log_history_progress("2026-08-02", "ETHUSDT", 1_000_000)
+
+    assert caplog.messages == [
+        "History progress 2026-08-02 ETHUSDT: 1,000,000 source trades"
+    ]
 
 
 def test_imports_streaming_bars_and_reuses_verified_day(
