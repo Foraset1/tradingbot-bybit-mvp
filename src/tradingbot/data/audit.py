@@ -19,7 +19,7 @@ import uuid
 from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Final
 
@@ -138,6 +138,7 @@ class DatasetAuditReport:
     dataset_root: str
     expected_symbols: tuple[str, ...]
     kline_intervals: tuple[str, ...]
+    partition_date: str | None
     input_fingerprint: str
     files: tuple[AuditFile, ...]
     partial_files: tuple[str, ...]
@@ -196,6 +197,7 @@ class DatasetAuditReport:
             "policy": {
                 "expected_symbols": list(self.expected_symbols),
                 "kline_intervals": list(self.kline_intervals),
+                "partition_date": self.partition_date,
             },
         }
 
@@ -1250,6 +1252,34 @@ def _normalized_values(values: Sequence[str], label: str) -> tuple[str, ...]:
     return normalized
 
 
+def _normalized_partition_date(value: date | str | None) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        raise ValueError("partition_date must be a date without a time")
+    if isinstance(value, date):
+        return value
+    if not isinstance(value, str):
+        raise ValueError("partition_date must be an ISO date")
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError("partition_date must be an ISO date (YYYY-MM-DD)") from exc
+    if parsed.isoformat() != value:
+        raise ValueError("partition_date must be an ISO date (YYYY-MM-DD)")
+    return parsed
+
+
+def _path_matches_partition(path: Path, root: Path, selected: date) -> bool:
+    parts = path.relative_to(root).parts
+    expected = (
+        f"{selected.year:04d}",
+        f"{selected.month:02d}",
+        f"{selected.day:02d}",
+    )
+    return len(parts) >= 4 and parts[-4:-1] == expected
+
+
 def audit_dataset(
     root: str | Path,
     symbols: Sequence[str],
@@ -1258,6 +1288,7 @@ def audit_dataset(
     strict: bool = False,
     *,
     scratch_dir: str | Path | None = None,
+    partition_date: date | str | None = None,
 ) -> DatasetAuditReport:
     """Audit normalized raw data and return a deterministic readiness report.
 
@@ -1273,6 +1304,7 @@ def audit_dataset(
         or minimum_duration_seconds < 0
     ):
         raise ValueError("minimum_duration_seconds must be finite and non-negative")
+    selected_partition = _normalized_partition_date(partition_date)
     expected_symbols = _normalized_values(symbols, "symbols")
     intervals = _normalized_values(kline_intervals, "kline_intervals")
     root_path = Path(root).resolve()
@@ -1306,12 +1338,24 @@ def audit_dataset(
                 "dataset root does not exist or is not a directory",
             )
         else:
+            completed_candidates = root_path.rglob("*.jsonl")
+            partial_candidates = root_path.rglob("*.jsonl.partial")
+            if selected_partition is not None:
+                completed_candidates = (
+                    item
+                    for item in completed_candidates
+                    if _path_matches_partition(item, root_path, selected_partition)
+                )
+                partial_candidates = (
+                    item
+                    for item in partial_candidates
+                    if _path_matches_partition(item, root_path, selected_partition)
+                )
             completed_paths = sorted(
-                root_path.rglob("*.jsonl"), key=lambda item: _relative(item, root_path)
+                completed_candidates, key=lambda item: _relative(item, root_path)
             )
             partial_paths = sorted(
-                root_path.rglob("*.jsonl.partial"),
-                key=lambda item: _relative(item, root_path),
+                partial_candidates, key=lambda item: _relative(item, root_path)
             )
             partial_files = tuple(_relative(item, root_path) for item in partial_paths)
             if partial_files:
@@ -1417,6 +1461,9 @@ def audit_dataset(
         dataset_root=root_path.as_posix(),
         expected_symbols=expected_symbols,
         kline_intervals=intervals,
+        partition_date=(
+            None if selected_partition is None else selected_partition.isoformat()
+        ),
         input_fingerprint=_input_fingerprint(files),
         files=tuple(files),
         partial_files=partial_files,

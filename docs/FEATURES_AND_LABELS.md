@@ -11,8 +11,9 @@ maker fill или решения «торговать».
 
 ## Входной gate
 
-`build-research` принимает каталог, созданный `build-dataset`. Перед чтением данных команда
-повторно проверяет:
+`build-research` принимает либо один dataset, созданный `build-dataset`, либо
+`catalog.json` последовательных суточных архивов. Перед чтением данных команда повторно
+проверяет:
 
 - `source-audit.json`;
 - ID и schema version канонического dataset;
@@ -20,6 +21,8 @@ maker fill или решения «торговать».
 - входной и выходной fingerprint канонического manifest.
 
 Произвольный набор Parquet-файлов без прошедшего gate не принимается.
+Для archive catalog дополнительно требуются последовательные UTC-дни и одинаковый набор
+символов во всех дневных datasets.
 
 ## Запуск
 
@@ -29,6 +32,15 @@ maker fill или решения «торговать».
 docker compose run --rm --no-deps collector \
   python -m tradingbot build-research \
   --dataset /data/datasets/canonical-v1-dfd2a620552d79b9 \
+  --output-root /data/research
+```
+
+После длительного сбора предпочтительным источником является суточный каталог:
+
+```bash
+docker compose run --rm --no-deps collector \
+  python -m tradingbot build-research \
+  --catalog /data/archive/catalog.json \
   --output-root /data/research
 ```
 

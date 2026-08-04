@@ -385,3 +385,40 @@ def test_schema_v1_requires_bybit_source(tmp_path: Path) -> None:
 
     assert "invalid_source" in issue_codes(report.errors)
     assert not report.ok
+
+
+def test_partition_audit_excludes_other_days_and_the_active_current_day(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "raw"
+    populate_complete_dataset(root)
+    next_day = BASE_TS_MS + 86_400_000
+    write_records(
+        root,
+        "ticker",
+        [record("ticker", {"lastPrice": "102"}, exchange_ts_ms=next_day)],
+    )
+    current_partial = (
+        root
+        / "ticker"
+        / "BTCUSDT"
+        / "2024"
+        / "01"
+        / "02"
+        / "part-current.jsonl.partial"
+    )
+    current_partial.write_text('{"still":"active"}\n', encoding="utf-8")
+
+    report = audit_dataset(
+        root,
+        ["BTCUSDT"],
+        ["1"],
+        partition_date="2024-01-01",
+    )
+
+    assert report.ok
+    assert report.partition_date == "2024-01-01"
+    assert report.partial_files == ()
+    assert len(report.files) == 4
+    assert all("/2024/01/01/" in f"/{item.path}" for item in report.files)
+    assert report.to_dict()["policy"]["partition_date"] == "2024-01-01"  # type: ignore[index]

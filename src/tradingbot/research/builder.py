@@ -17,7 +17,7 @@ import shutil
 import uuid
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any, Final, cast
 
@@ -253,6 +253,69 @@ def _load_canonical_source(dataset_path: str | Path) -> _CanonicalSource:
         symbols=tuple(sorted(symbols)),
         files=tuple(sorted(files, key=lambda item: item.path)),
         total_bytes=total_bytes,
+    )
+
+
+def _load_archive_catalog_source(catalog_path: str | Path) -> _CanonicalSource:
+    from tradingbot.data.archive import ArchiveError, load_archive_catalog
+
+    try:
+        catalog = load_archive_catalog(
+            catalog_path,
+            verify_canonical_files=False,
+        )
+    except ArchiveError as exc:
+        raise ResearchBuildError(f"archive catalog validation failed: {exc}") from exc
+    if not catalog.entries:
+        raise ResearchBuildError("archive catalog contains no committed days")
+    parsed_dates = tuple(date.fromisoformat(item.partition_date) for item in catalog.entries)
+    for previous, current in zip(parsed_dates, parsed_dates[1:], strict=False):
+        if current != previous + timedelta(days=1):
+            raise ResearchBuildError(
+                "research archive catalog must contain consecutive UTC days"
+            )
+
+    archive_root = catalog.path.parent.resolve()
+    daily_sources = tuple(
+        _load_canonical_source(day.canonical_dataset_path) for day in catalog.entries
+    )
+    symbols = daily_sources[0].symbols
+    combined_files: list[_CanonicalFile] = []
+    for day, source in zip(catalog.entries, daily_sources, strict=True):
+        if source.symbols != symbols:
+            raise ResearchBuildError(
+                f"archive day {day.partition_date} uses another symbol universe"
+            )
+        try:
+            dataset_relative = source.root.relative_to(archive_root)
+        except ValueError as exc:
+            raise ResearchBuildError(
+                f"archive day {day.partition_date} escapes the archive root"
+            ) from exc
+        for item in source.files:
+            combined = PurePosixPath(dataset_relative.as_posix()) / item.path
+            combined_files.append(
+                _CanonicalFile(
+                    path=combined.as_posix(),
+                    kind=item.kind,
+                    symbol=item.symbol,
+                    date=item.date,
+                    rows=item.rows,
+                    bytes=item.bytes,
+                    sha256=item.sha256,
+                )
+            )
+    if len({item.path for item in combined_files}) != len(combined_files):
+        raise ResearchBuildError("archive catalog resolves to duplicate Parquet paths")
+    return _CanonicalSource(
+        dataset_id=f"archive-catalog-v1-{catalog.fingerprint[:16]}",
+        root=archive_root,
+        manifest_path=catalog.path,
+        manifest_sha256=_sha256_file(catalog.path),
+        output_fingerprint=catalog.fingerprint,
+        symbols=symbols,
+        files=tuple(sorted(combined_files, key=lambda item: item.path)),
+        total_bytes=sum(item.bytes for item in combined_files),
     )
 
 
@@ -1195,7 +1258,7 @@ def _write_parquet_outputs(
             )
 
     files: list[ResearchFile] = []
-    for (table_name, symbol, date), rows in sorted(groups.items()):
+    for (table_name, symbol, partition_date), rows in sorted(groups.items()):
         schema = FEATURE_SCHEMA if table_name == "features" else LABEL_SCHEMA
         if table_name == "features":
             rows.sort(key=lambda row: int(cast(int, row["decision_at_ns"])))
@@ -1210,7 +1273,7 @@ def _write_parquet_outputs(
         relative = (
             Path(f"table={table_name}")
             / f"symbol={symbol}"
-            / f"date={date}"
+            / f"date={partition_date}"
             / "part-00000.parquet"
         )
         path = root / relative
@@ -1234,7 +1297,7 @@ def _write_parquet_outputs(
                 path=relative.as_posix(),
                 table=table_name,
                 symbol=symbol,
-                date=date,
+                date=partition_date,
                 rows=len(rows),
                 bytes=path.stat().st_size,
                 sha256=_sha256_file(path),
@@ -1392,18 +1455,15 @@ def _safe_output_root(source_root: Path, output_root: Path) -> None:
         raise ResearchBuildError("canonical and research output roots must not overlap")
 
 
-def build_research_dataset(
-    canonical_dataset: str | Path,
+def _build_research_dataset(
+    source: _CanonicalSource,
     output_root: str | Path,
     *,
     parameters: ResearchParameters | None = None,
     minimum_free_bytes: int = 0,
 ) -> ResearchBuildResult:
-    """Build or validate a deterministic causal feature/label dataset."""
-
     selected_parameters = ResearchParameters() if parameters is None else parameters
     selected_parameters.validate()
-    source = _load_canonical_source(canonical_dataset)
     destination_root = Path(output_root).expanduser().resolve()
     _safe_output_root(source.root, destination_root)
     destination_root.mkdir(parents=True, exist_ok=True)
@@ -1555,3 +1615,37 @@ def build_research_dataset(
         if staging_path.is_dir() and staging_path.parent == destination_root:
             shutil.rmtree(staging_path, ignore_errors=True)
         raise
+
+
+def build_research_dataset(
+    canonical_dataset: str | Path,
+    output_root: str | Path,
+    *,
+    parameters: ResearchParameters | None = None,
+    minimum_free_bytes: int = 0,
+) -> ResearchBuildResult:
+    """Build causal features and labels from one canonical dataset."""
+
+    return _build_research_dataset(
+        _load_canonical_source(canonical_dataset),
+        output_root,
+        parameters=parameters,
+        minimum_free_bytes=minimum_free_bytes,
+    )
+
+
+def build_research_dataset_from_catalog(
+    archive_catalog: str | Path,
+    output_root: str | Path,
+    *,
+    parameters: ResearchParameters | None = None,
+    minimum_free_bytes: int = 0,
+) -> ResearchBuildResult:
+    """Build causal features and labels from consecutive daily archives."""
+
+    return _build_research_dataset(
+        _load_archive_catalog_source(archive_catalog),
+        output_root,
+        parameters=parameters,
+        minimum_free_bytes=minimum_free_bytes,
+    )

@@ -51,6 +51,8 @@
 - `schema_version`, источник и session ID в каждой новой записи;
 - потоковый audit JSONL с coverage, gap/duplicate checks и SHA-256 fingerprint входов;
 - атомарный канонический Parquet dataset с повторной SHA-256 проверкой raw-сегментов;
+- неизменяемый суточный Parquet-архив и детерминированный каталог UTC-разделов;
+- безопасный dry-run retention: raw разрешён к очистке только после сверки архива и SHA-256;
 - типизированные orderbook, trades, ticker и kline таблицы с ZSTD-сжатием;
 - causal last-write-wins для ревизий закрытых свечей и versioned dataset manifest;
 - минутная UTC decision grid с проверкой `received_at_ns <= decision_at_ns`;
@@ -86,6 +88,8 @@ tradingbot audit-data
 [`docs/SOAK_TEST.md`](docs/SOAK_TEST.md).
 Построение проверенного Parquet-слоя описано в
 [`docs/DATASET.md`](docs/DATASET.md).
+Ежедневный архив, каталог и проверка retention описаны в
+[`docs/DAILY_ARCHIVE.md`](docs/DAILY_ARCHIVE.md).
 Контракт causal features и market labels описан в
 [`docs/FEATURES_AND_LABELS.md`](docs/FEATURES_AND_LABELS.md).
 Запуск baseline, LightGBM и cost-aware backtest описан в
@@ -121,9 +125,10 @@ Compose-файла. Данные и health-файл сохраняются в и
 
 Стаканы и сделки могут давать несколько гигабайт необжатых данных в сутки. В локальном
 90-секундном smoke-test было записано 2 835 799 байт — грубая экстраполяция около
-2,71 GB/сутки до учёта рыночного режима. На диске 100 GB безопасное локальное окно — 14 дней;
-disk guard оставляет минимум 15 GiB свободного места и останавливает сбор вместо заполнения
-файловой системы. Автоматическое удаление старых данных пока не реализовано.
+2,71 GB/сутки до учёта рыночного режима. На диске 100 GB целевое окно raw — 7 дней;
+завершённые UTC-дни сохраняются в существенно меньшем Parquet-архиве. Disk guard оставляет
+минимум 15 GiB свободного места и останавливает сбор вместо заполнения файловой системы.
+Версия 0.5.0 строит только проверяемый dry-run очистки и ещё не удаляет файлы.
 
 ## Формат данных
 
@@ -184,6 +189,14 @@ tradingbot build-dataset \
 ```bash
 tradingbot build-research \
   --dataset data/datasets/canonical-v1-<input-fingerprint> \
+  --output-root data/research
+```
+
+Для длительного сбора используется каталог последовательных суточных архивов:
+
+```bash
+tradingbot build-research \
+  --catalog data/archive/catalog.json \
   --output-root data/research
 ```
 

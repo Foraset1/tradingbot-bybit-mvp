@@ -7,6 +7,7 @@ import logging
 import os
 import signal
 from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from tradingbot.config import AppConfig, ConfigError, load_config
@@ -68,6 +69,11 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="Optionally write the same JSON report atomically to this path",
     )
+    audit.add_argument(
+        "--partition-date",
+        default=None,
+        help="Only audit one UTC partition (YYYY-MM-DD)",
+    )
     dataset = subparsers.add_parser(
         "build-dataset",
         help="Build deterministic canonical Parquet from a successful strict audit",
@@ -94,11 +100,16 @@ def _parser() -> argparse.ArgumentParser:
         "build-research",
         help="Build causal features and market labels from canonical Parquet",
     )
-    research.add_argument(
+    research_source = research.add_mutually_exclusive_group(required=True)
+    research_source.add_argument(
         "--dataset",
         type=Path,
-        required=True,
         help="Canonical dataset directory containing manifest.json",
+    )
+    research_source.add_argument(
+        "--catalog",
+        type=Path,
+        help="Daily archive catalog.json used as a multi-day canonical source",
     )
     research.add_argument(
         "--output-root",
@@ -121,6 +132,72 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Evaluation parent directory (defaults to evaluations beside storage.root)",
+    )
+    archive = subparsers.add_parser(
+        "archive-day",
+        help="Strictly audit and archive one completed UTC day as immutable Parquet",
+    )
+    archive.add_argument(
+        "--date",
+        default=None,
+        help="UTC partition to archive (YYYY-MM-DD; defaults to yesterday)",
+    )
+    archive.add_argument(
+        "--root",
+        type=Path,
+        default=None,
+        help="Raw root (defaults to storage.root)",
+    )
+    archive.add_argument(
+        "--archive-root",
+        type=Path,
+        default=None,
+        help="Archive root (defaults to archive.root)",
+    )
+    archive.add_argument(
+        "--minimum-duration-seconds",
+        type=float,
+        default=None,
+        help="Minimum coverage per expected stream",
+    )
+    archive.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Optionally write the result JSON atomically to this path",
+    )
+    retention = subparsers.add_parser(
+        "plan-retention",
+        help="Verify archives and print a raw-retention dry-run; never deletes files",
+    )
+    retention.add_argument(
+        "--root",
+        type=Path,
+        default=None,
+        help="Raw root (defaults to storage.root)",
+    )
+    retention.add_argument(
+        "--archive-root",
+        type=Path,
+        default=None,
+        help="Archive root (defaults to archive.root)",
+    )
+    retention.add_argument(
+        "--retention-days",
+        type=int,
+        default=None,
+        help="Number of complete raw days to retain",
+    )
+    retention.add_argument(
+        "--as-of-date",
+        default=None,
+        help="UTC policy date (YYYY-MM-DD; defaults to today)",
+    )
+    retention.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Optionally write the dry-run JSON atomically to this path",
     )
     return parser
 
@@ -247,6 +324,7 @@ def _run_data_audit(
     minimum_duration_seconds: float,
     strict: bool,
     output: Path | None,
+    partition_date: str | None,
 ) -> None:
     report = audit_dataset(
         root=config.storage.root if root is None else root,
@@ -255,6 +333,7 @@ def _run_data_audit(
         minimum_duration_seconds=minimum_duration_seconds,
         strict=strict,
         scratch_dir=config.storage.health_path.parent,
+        partition_date=partition_date,
     )
     payload = report.to_dict()
     rendered = json.dumps(payload, indent=2, sort_keys=True) + "\n"
@@ -275,6 +354,13 @@ def _config_summary(config: AppConfig) -> dict[str, object]:
         "health_path": str(config.storage.health_path),
         "stale_connection_seconds": config.bybit.stale_connection_seconds,
         "min_free_bytes": config.storage.min_free_bytes,
+        "archive": {
+            "root": str(config.archive.root),
+            "raw_retention_days": config.archive.raw_retention_days,
+            "daily_minimum_duration_seconds": (
+                config.archive.daily_minimum_duration_seconds
+            ),
+        },
         "risk": {
             "max_notional_fraction": config.risk.max_notional_fraction,
             "target_risk_fraction": config.risk.target_risk_fraction,
@@ -333,11 +419,15 @@ def _run_build_dataset(
 
 def _run_build_research(
     config: AppConfig,
-    dataset: Path,
+    dataset: Path | None,
+    catalog: Path | None,
     output_root: Path | None,
 ) -> None:
     try:
-        from tradingbot.research.builder import build_research_dataset
+        from tradingbot.research.builder import (
+            build_research_dataset,
+            build_research_dataset_from_catalog,
+        )
         from tradingbot.research.contracts import ResearchBuildError
     except ModuleNotFoundError as exc:
         if exc.name in {"numpy", "pyarrow"} or (exc.name or "").startswith(
@@ -356,11 +446,20 @@ def _run_build_research(
         else output_root
     )
     try:
-        result = build_research_dataset(
-            canonical_dataset=dataset,
-            output_root=destination,
-            minimum_free_bytes=config.storage.min_free_bytes,
-        )
+        if catalog is not None:
+            result = build_research_dataset_from_catalog(
+                archive_catalog=catalog,
+                output_root=destination,
+                minimum_free_bytes=config.storage.min_free_bytes,
+            )
+        elif dataset is not None:
+            result = build_research_dataset(
+                canonical_dataset=dataset,
+                output_root=destination,
+                minimum_free_bytes=config.storage.min_free_bytes,
+            )
+        else:  # guarded by argparse, retained for direct callers
+            raise ResearchBuildError("one research source must be selected")
     except ResearchBuildError as exc:
         LOGGER.error("Research build rejected: %s", exc)
         raise SystemExit(1) from exc
@@ -404,6 +503,86 @@ def _run_backtest(
     print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
 
 
+def _run_archive_day(
+    config: AppConfig,
+    partition_date: str | None,
+    raw_root: Path | None,
+    archive_root: Path | None,
+    minimum_duration_seconds: float | None,
+    output: Path | None,
+) -> None:
+    try:
+        from tradingbot.data.archive import ArchiveError, archive_day
+    except ModuleNotFoundError as exc:
+        if exc.name == "pyarrow" or (exc.name or "").startswith("pyarrow."):
+            LOGGER.error(
+                "Archive support is not installed; install the project with "
+                "the [dataset] extra"
+            )
+            raise SystemExit(1) from exc
+        raise
+
+    selected_date = (
+        (datetime.now(UTC).date() - timedelta(days=1)).isoformat()
+        if partition_date is None
+        else partition_date
+    )
+    try:
+        result = archive_day(
+            raw_root=config.storage.root if raw_root is None else raw_root,
+            archive_root=config.archive.root if archive_root is None else archive_root,
+            symbols=config.bybit.symbols,
+            kline_intervals=config.market.kline_intervals,
+            partition_date=selected_date,
+            minimum_duration_seconds=(
+                config.archive.daily_minimum_duration_seconds
+                if minimum_duration_seconds is None
+                else minimum_duration_seconds
+            ),
+            minimum_free_bytes=config.storage.min_free_bytes,
+            scratch_dir=config.storage.health_path.parent,
+        )
+    except (ArchiveError, ValueError) as exc:
+        LOGGER.error("Daily archive rejected: %s", exc)
+        raise SystemExit(1) from exc
+    payload = result.to_dict()
+    if output is not None:
+        write_health(output.expanduser().resolve(), payload)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _run_retention_plan(
+    config: AppConfig,
+    raw_root: Path | None,
+    archive_root: Path | None,
+    retention_days: int | None,
+    as_of_date: str | None,
+    output: Path | None,
+) -> None:
+    from tradingbot.data.archive import ArchiveError, plan_raw_retention
+
+    try:
+        plan = plan_raw_retention(
+            raw_root=config.storage.root if raw_root is None else raw_root,
+            archive_root=config.archive.root if archive_root is None else archive_root,
+            retention_days=(
+                config.archive.raw_retention_days
+                if retention_days is None
+                else retention_days
+            ),
+            as_of_date=as_of_date,
+        )
+    except ArchiveError as exc:
+        LOGGER.error("Retention plan rejected: %s", exc)
+        raise SystemExit(1) from exc
+    payload = plan.to_dict()
+    if output is not None:
+        write_health(output.expanduser().resolve(), payload)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    if plan.blockers:
+        raise SystemExit(1)
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = _parser()
     args = parser.parse_args(argv)
@@ -432,6 +611,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.minimum_duration_seconds,
             args.strict,
             args.output,
+            args.partition_date,
         )
         return
     if args.command == "build-dataset":
@@ -446,10 +626,31 @@ def main(argv: Sequence[str] | None = None) -> None:
         _run_build_research(
             config,
             args.dataset,
+            args.catalog,
             args.output_root,
         )
         return
     if args.command == "run-backtest":
         _run_backtest(config, args.research_dataset, args.output_root)
+        return
+    if args.command == "archive-day":
+        _run_archive_day(
+            config,
+            args.date,
+            args.root,
+            args.archive_root,
+            args.minimum_duration_seconds,
+            args.output,
+        )
+        return
+    if args.command == "plan-retention":
+        _run_retention_plan(
+            config,
+            args.root,
+            args.archive_root,
+            args.retention_days,
+            args.as_of_date,
+            args.output,
+        )
         return
     parser.error(f"Unknown command: {args.command}")

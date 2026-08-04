@@ -21,6 +21,7 @@ def test_validate_config_command_reports_read_only_mode(
     assert summary["mode"] == "public-read-only"
     assert summary["topics"] == 36
     assert summary["risk"]["max_open_positions"] == 1
+    assert summary["archive"]["raw_retention_days"] == 7
 
 
 def test_audit_data_command_prints_report_and_fails_when_streams_are_missing(
