@@ -199,6 +199,39 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="Optionally write the dry-run JSON atomically to this path",
     )
+    history = subparsers.add_parser(
+        "import-history",
+        help="Stream official Bybit daily trades into compact 1s/1m Parquet bars",
+    )
+    history.add_argument(
+        "--from-date",
+        required=True,
+        help="First completed UTC day to import (YYYY-MM-DD, inclusive)",
+    )
+    history.add_argument(
+        "--to-date",
+        required=True,
+        help="Last completed UTC day to import (YYYY-MM-DD, inclusive)",
+    )
+    history.add_argument(
+        "--symbol",
+        dest="symbols",
+        action="append",
+        default=None,
+        help="Import one configured symbol; repeat to select several (default: all)",
+    )
+    history.add_argument(
+        "--history-root",
+        type=Path,
+        default=None,
+        help="History root (defaults to history.root)",
+    )
+    history.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Optionally write the range result JSON atomically to this path",
+    )
     return parser
 
 
@@ -360,6 +393,14 @@ def _config_summary(config: AppConfig) -> dict[str, object]:
             "daily_minimum_duration_seconds": (
                 config.archive.daily_minimum_duration_seconds
             ),
+        },
+        "history": {
+            "root": str(config.history.root),
+            "public_base_url": config.history.public_base_url,
+            "assumed_latency_ms": config.history.assumed_latency_ms,
+            "maximum_missing_minutes": config.history.maximum_missing_minutes,
+            "profile": "price_futures_v1",
+            "retains_individual_trades": False,
         },
         "risk": {
             "max_notional_fraction": config.risk.max_notional_fraction,
@@ -583,6 +624,78 @@ def _run_retention_plan(
         raise SystemExit(1)
 
 
+def _run_history_import(
+    config: AppConfig,
+    start_date: str,
+    end_date: str,
+    symbols: Sequence[str] | None,
+    history_root: Path | None,
+    output: Path | None,
+) -> None:
+    try:
+        from tradingbot.data.bybit_history import (
+            HistoryImportError,
+            import_bybit_history_range,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name == "pyarrow" or (exc.name or "").startswith("pyarrow."):
+            LOGGER.error(
+                "History import support is not installed; install the project with "
+                "the [dataset] extra"
+            )
+            raise SystemExit(1) from exc
+        raise
+
+    selected_symbols = config.bybit.symbols if symbols is None else tuple(symbols)
+    unknown = sorted(set(selected_symbols) - set(config.bybit.symbols))
+    if unknown:
+        LOGGER.error("History symbols are not configured: %s", ", ".join(unknown))
+        raise SystemExit(1)
+    destination = (
+        config.history.root if history_root is None else history_root
+    ).expanduser().resolve()
+    for label, protected in (
+        ("storage.root", config.storage.root),
+        ("archive.root", config.archive.root),
+    ):
+        if destination.is_relative_to(protected) or protected.is_relative_to(
+            destination
+        ):
+            LOGGER.error("History root must not overlap %s", label)
+            raise SystemExit(1)
+    try:
+        result = import_bybit_history_range(
+            history_root=destination,
+            start_date=start_date,
+            end_date=end_date,
+            symbols=selected_symbols,
+            public_base_url=config.history.public_base_url,
+            assumed_latency_ms=config.history.assumed_latency_ms,
+            request_timeout_seconds=config.history.request_timeout_seconds,
+            download_attempts=config.history.download_attempts,
+            maximum_missing_minutes=config.history.maximum_missing_minutes,
+            minimum_free_bytes=config.storage.min_free_bytes,
+        )
+    except HistoryImportError as exc:
+        LOGGER.error("Official history import rejected: %s", exc)
+        payload: dict[str, object] = {
+            "ok": False,
+            "dataset_profile": "price_futures_v1",
+            "start_date": start_date,
+            "end_date": end_date,
+            "symbols": list(selected_symbols),
+            "error": str(exc),
+        }
+        if output is not None:
+            write_health(output.expanduser().resolve(), payload)
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        raise SystemExit(1) from exc
+    payload = result.to_dict()
+    if output is not None:
+        write_health(output.expanduser().resolve(), payload)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = _parser()
     args = parser.parse_args(argv)
@@ -650,6 +763,16 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.archive_root,
             args.retention_days,
             args.as_of_date,
+            args.output,
+        )
+        return
+    if args.command == "import-history":
+        _run_history_import(
+            config,
+            args.from_date,
+            args.to_date,
+            args.symbols,
+            args.history_root,
             args.output,
         )
         return

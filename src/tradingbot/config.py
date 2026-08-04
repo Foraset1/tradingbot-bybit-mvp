@@ -54,6 +54,16 @@ class ArchiveConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class HistoryConfig:
+    root: Path
+    public_base_url: str
+    assumed_latency_ms: int
+    request_timeout_seconds: int
+    download_attempts: int
+    maximum_missing_minutes: int
+
+
+@dataclass(frozen=True, slots=True)
 class RiskConfig:
     max_notional_fraction: float
     target_risk_fraction: float
@@ -96,6 +106,7 @@ class AppConfig:
     market: MarketConfig
     storage: StorageConfig
     archive: ArchiveConfig
+    history: HistoryConfig
     risk: RiskConfig
     evaluation: EvaluationConfig
     source_path: Path
@@ -168,6 +179,24 @@ def _validate_ws_url(url: str) -> None:
     parsed = urlparse(url)
     if parsed.scheme != "wss" or not parsed.hostname:
         raise ConfigError("bybit.public_ws_url must be a valid wss:// URL")
+
+
+def _validate_history_url(url: str) -> None:
+    parsed = urlparse(url)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "public.bybit.com"
+        or parsed.port is not None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path.rstrip("/") != "/trading"
+    ):
+        raise ConfigError(
+            "history.public_base_url must be the official "
+            "https://public.bybit.com/trading endpoint"
+        )
 
 
 def _validate_symbols(symbols: tuple[str, ...]) -> None:
@@ -268,6 +297,7 @@ def load_config(path: str | Path) -> AppConfig:
     market_raw = _table(raw, "market")
     storage_raw = _table(raw, "storage")
     archive_raw = _table(raw, "archive")
+    history_raw = _table(raw, "history")
     risk_raw = _table(raw, "risk")
     evaluation_raw = _table(raw, "evaluation")
 
@@ -385,6 +415,34 @@ def load_config(path: str | Path) -> AppConfig:
                 "archive",
             ),
             "archive.daily_minimum_duration_seconds",
+        ),
+    )
+
+    default_history_root = _string(
+        _required(history_raw, "root", "history"), "history.root"
+    )
+    history_root_value = os.getenv("TRADINGBOT_HISTORY_ROOT", default_history_root)
+    history = HistoryConfig(
+        root=_resolve_path(history_root_value, "history.root", project_root),
+        public_base_url=_string(
+            _required(history_raw, "public_base_url", "history"),
+            "history.public_base_url",
+        ).rstrip("/"),
+        assumed_latency_ms=_integer(
+            _required(history_raw, "assumed_latency_ms", "history"),
+            "history.assumed_latency_ms",
+        ),
+        request_timeout_seconds=_integer(
+            _required(history_raw, "request_timeout_seconds", "history"),
+            "history.request_timeout_seconds",
+        ),
+        download_attempts=_integer(
+            _required(history_raw, "download_attempts", "history"),
+            "history.download_attempts",
+        ),
+        maximum_missing_minutes=_integer(
+            _required(history_raw, "maximum_missing_minutes", "history"),
+            "history.maximum_missing_minutes",
         ),
     )
 
@@ -513,6 +571,7 @@ def load_config(path: str | Path) -> AppConfig:
     )
 
     _validate_ws_url(bybit.public_ws_url)
+    _validate_history_url(history.public_base_url)
     _validate_symbols(bybit.symbols)
     if bybit.heartbeat_seconds <= 0:
         raise ConfigError("heartbeat_seconds must be positive")
@@ -558,6 +617,31 @@ def load_config(path: str | Path) -> AppConfig:
         or storage.root.is_relative_to(archive.root)
     ):
         raise ConfigError("archive.root and storage.root must not overlap")
+    if not 0 <= history.assumed_latency_ms <= 60_000:
+        raise ConfigError("history.assumed_latency_ms must be within [0, 60000]")
+    if not 1 <= history.request_timeout_seconds <= 300:
+        raise ConfigError(
+            "history.request_timeout_seconds must be within [1, 300]"
+        )
+    if not 1 <= history.download_attempts <= 10:
+        raise ConfigError("history.download_attempts must be within [1, 10]")
+    if not 0 <= history.maximum_missing_minutes < 1_440:
+        raise ConfigError(
+            "history.maximum_missing_minutes must be within [0, 1440)"
+        )
+    roots = {
+        "storage.root": storage.root,
+        "archive.root": archive.root,
+        "history.root": history.root,
+    }
+    for left_name, left_path in roots.items():
+        for right_name, right_path in roots.items():
+            if left_name >= right_name:
+                continue
+            if left_path.is_relative_to(right_path) or right_path.is_relative_to(
+                left_path
+            ):
+                raise ConfigError(f"{left_name} and {right_name} must not overlap")
     _validate_risk(risk)
     _validate_evaluation(evaluation, risk)
 
@@ -566,6 +650,7 @@ def load_config(path: str | Path) -> AppConfig:
         market=market,
         storage=storage,
         archive=archive,
+        history=history,
         risk=risk,
         evaluation=evaluation,
         source_path=source_path,
