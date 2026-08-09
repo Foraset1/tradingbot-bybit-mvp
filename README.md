@@ -143,7 +143,9 @@ tradingbot import-history \
 
 Команда строит 1s/1m trade-bars и проверяемый `/data/history/catalog.json`. Она не создаёт
 стакан, ticker, funding или open interest и пока не является входом существующего
-microstructure `build-research`.
+microstructure `build-research`. Минуты без публичных сделок сохраняются как явные gaps;
+защитный лимит применяется к самому длинному непрерывному trade-free интервалу, а не к
+общему количеству разрозненных пустых минут за сутки.
 
 ## Формат данных
 
