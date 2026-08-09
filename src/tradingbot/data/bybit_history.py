@@ -51,6 +51,7 @@ PARQUET_COMPRESSION: Final = "zstd"
 PARQUET_COMPRESSION_LEVEL: Final = 3
 BAR_BATCH_ROWS: Final = 10_000
 NANOSECONDS_PER_SECOND: Final = 1_000_000_000
+MILLISECONDS_PER_MINUTE: Final = 60_000
 MILLISECONDS_PER_DAY: Final = 86_400_000
 EXPECTED_MINUTES_PER_DAY: Final = 1_440
 USER_AGENT: Final = f"tradingbot-bybit/{__version__} history-import"
@@ -170,6 +171,7 @@ class _SymbolArtifact:
     files: tuple[HistoryFile, ...]
     rows_by_kind: dict[str, int]
     missing_minutes: int
+    longest_missing_minute_run: int
     seconds_with_trades: int
     symbol_manifest_sha256: str
     reused: bool
@@ -758,6 +760,7 @@ def _process_archive(
     previous_trade_id: str | None = None
     current_second: _TradeBar | None = None
     current_minute: _TradeBar | None = None
+    longest_missing_minute_run = 0
     csv_header: tuple[str, ...] = ()
     selected_fields: dict[str, str] = {}
     parsed_date = _parse_partition_date(partition_date)
@@ -830,9 +833,32 @@ def _process_archive(
                     current_second.observe(event_ns=event_ns, price=price, size=size, side=side)
 
                 minute_start = _bar_start_ms(event_ns, 60)
-                if current_minute is None or current_minute.start_ms != minute_start:
-                    if current_minute is not None:
-                        minute_writer.add(current_minute, assumed_latency_ms)
+                if current_minute is None:
+                    leading_missing_minutes = (
+                        minute_start - day_start_ns // 1_000_000
+                    ) // MILLISECONDS_PER_MINUTE
+                    longest_missing_minute_run = max(
+                        longest_missing_minute_run,
+                        leading_missing_minutes,
+                    )
+                    current_minute = _TradeBar.first(
+                        symbol=symbol,
+                        interval_seconds=60,
+                        start_ms=minute_start,
+                        event_ns=event_ns,
+                        price=price,
+                        size=size,
+                        side=side,
+                    )
+                elif current_minute.start_ms != minute_start:
+                    missing_between_bars = (
+                        minute_start - current_minute.start_ms
+                    ) // MILLISECONDS_PER_MINUTE - 1
+                    longest_missing_minute_run = max(
+                        longest_missing_minute_run,
+                        missing_between_bars,
+                    )
+                    minute_writer.add(current_minute, assumed_latency_ms)
                     current_minute = _TradeBar.first(
                         symbol=symbol,
                         interval_seconds=60,
@@ -856,6 +882,14 @@ def _process_archive(
         if source_rows == 0 or first_event_ns is None or previous_event_ns is None:
             raise HistoryImportError(f"archive contains no trades: {url}")
         assert current_second is not None and current_minute is not None
+        trailing_missing_minutes = (
+            day_end_ns // 1_000_000
+            - (current_minute.start_ms + MILLISECONDS_PER_MINUTE)
+        ) // MILLISECONDS_PER_MINUTE
+        longest_missing_minute_run = max(
+            longest_missing_minute_run,
+            trailing_missing_minutes,
+        )
         second_writer.add(current_second, assumed_latency_ms)
         minute_writer.add(current_minute, assumed_latency_ms)
         second_writer.close()
@@ -875,10 +909,14 @@ def _process_archive(
         raise HistoryImportError(
             f"derived more than {EXPECTED_MINUTES_PER_DAY} minute bars for {symbol}"
         )
-    if missing_minutes > maximum_missing_minutes:
+    # Daily trade archives contain executions, not scheduled candles. Isolated
+    # minutes without a trade are valid sparse observations; a long consecutive
+    # silence is the useful conservative signal for an incomplete archive.
+    if longest_missing_minute_run > maximum_missing_minutes:
         raise HistoryImportError(
-            f"{symbol}/{partition_date} is missing {missing_minutes} trade minutes; "
-            f"configured maximum is {maximum_missing_minutes}"
+            f"{symbol}/{partition_date} has a longest trade-free gap of "
+            f"{longest_missing_minute_run} minutes; configured maximum is "
+            f"{maximum_missing_minutes} (total trade-free minutes: {missing_minutes})"
         )
 
     prefix = f"symbols/symbol={symbol}"
@@ -926,6 +964,7 @@ def _process_archive(
             "trade_bar_1s": second_writer.rows,
         },
         missing_minutes=missing_minutes,
+        longest_missing_minute_run=longest_missing_minute_run,
         seconds_with_trades=second_writer.rows,
         symbol_manifest_sha256="",
         reused=False,
@@ -948,6 +987,8 @@ def _symbol_manifest_payload(
             "adjacent_trade_ids_unique": True,
             "global_trade_id_deduplication": False,
             "missing_minutes": artifact.missing_minutes,
+            "longest_missing_minute_run": artifact.longest_missing_minute_run,
+            "missing_minute_policy": "longest_consecutive_trade_free_run",
             "seconds_with_trades": artifact.seconds_with_trades,
             "synthetic_bars": 0,
         },
@@ -984,7 +1025,9 @@ def _build_symbol(
 
     url = _archive_url(public_base_url, symbol, partition_date)
     last_error: Exception | None = None
+    attempts_made = 0
     for attempt in range(1, download_attempts + 1):
+        attempts_made = attempt
         temp_symbol_dir = stage_path / f".symbol={symbol}.tmp-{uuid.uuid4().hex}"
         temp_symbol_dir.mkdir()
         response: _ArchiveResponse | None = None
@@ -1054,7 +1097,7 @@ def _build_symbol(
                 shutil.rmtree(temp_symbol_dir, ignore_errors=True)
     assert last_error is not None
     raise HistoryImportError(
-        f"failed to import {symbol}/{partition_date} after {download_attempts} attempts: "
+        f"failed to import {symbol}/{partition_date} after {attempts_made} attempt(s): "
         f"{type(last_error).__name__}: {last_error}"
     ) from last_error
 
@@ -1207,6 +1250,19 @@ def _validate_symbol_artifact(
     if _required_int(quality.get("synthetic_bars"), "quality.synthetic_bars") != 0:
         raise HistoryImportError(f"history must not contain synthetic bars: {manifest_path}")
     missing_minutes = _required_int(quality.get("missing_minutes"), "quality.missing_minutes")
+    raw_longest_missing_minute_run = quality.get("longest_missing_minute_run")
+    if raw_longest_missing_minute_run is None:
+        # Manifests written before this metric was added were accepted only when
+        # total missing minutes were within the same limit, so this conservative
+        # fallback preserves safe reuse of existing verified days.
+        longest_missing_minute_run = missing_minutes
+    else:
+        longest_missing_minute_run = _required_int(
+            raw_longest_missing_minute_run,
+            "quality.longest_missing_minute_run",
+        )
+    if longest_missing_minute_run > missing_minutes:
+        raise HistoryImportError(f"history missing-minute quality mismatch: {manifest_path}")
     seconds_with_trades = _required_int(
         quality.get("seconds_with_trades"), "quality.seconds_with_trades", minimum=1
     )
@@ -1216,6 +1272,7 @@ def _validate_symbol_artifact(
         files=files,
         rows_by_kind=rows_by_kind,
         missing_minutes=missing_minutes,
+        longest_missing_minute_run=longest_missing_minute_run,
         seconds_with_trades=seconds_with_trades,
         symbol_manifest_sha256=_sha256_file(manifest_path),
         reused=reused,
@@ -1271,6 +1328,14 @@ def _day_manifest_payload(
             "queue_position_available": False,
             "funding_available": False,
             "open_interest_available": False,
+        },
+        "quality_policy": {
+            "trade_free_minutes_are_explicit_gaps": True,
+            "missing_minute_measure": "longest_consecutive_trade_free_run",
+            "maximum_consecutive_trade_free_minutes": parameters[
+                "maximum_missing_minutes"
+            ],
+            "parameters_key_retained_for_v1_compatibility": "maximum_missing_minutes",
         },
         "known_limitations": [
             "Global trade-ID deduplication is not performed during streaming aggregation.",

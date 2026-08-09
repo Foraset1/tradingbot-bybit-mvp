@@ -25,6 +25,7 @@ def test_validate_config_command_reports_read_only_mode(
     assert summary["risk"]["max_open_positions"] == 1
     assert summary["archive"]["raw_retention_days"] == 7
     assert summary["history"]["profile"] == "price_futures_v1"
+    assert summary["history"]["maximum_consecutive_trade_free_minutes"] == 5
     assert summary["history"]["retains_individual_trades"] is False
 
 

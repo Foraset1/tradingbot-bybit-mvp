@@ -48,8 +48,9 @@ public_base_url = "https://public.bybit.com/trading"
 assumed_latency_ms = 1000
 request_timeout_seconds = 60
 download_attempts = 3
-# Do not manufacture candles for minutes with no public trades. Up to five sparse
-# minutes are retained as explicit gaps; a larger daily gap rejects the archive.
+# Do not manufacture candles for minutes with no public trades. Sparse minutes
+# remain explicit gaps. This v1-compatible key limits the longest consecutive
+# trade-free run, not the total number of sparse minutes in the UTC day.
 maximum_missing_minutes = 5
 
 [risk]

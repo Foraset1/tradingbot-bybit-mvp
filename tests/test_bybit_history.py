@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import logging
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -35,13 +36,20 @@ class _FakeResponse(io.BytesIO):
 
 
 def _archive_payload(partition_date: str, *, minutes: int = 1_440) -> bytes:
+    return _archive_payload_for_minutes(partition_date, range(minutes))
+
+
+def _archive_payload_for_minutes(
+    partition_date: str,
+    minute_offsets: Iterable[int],
+) -> bytes:
     parsed = datetime.fromisoformat(f"{partition_date}T00:00:00+00:00")
     start_seconds = int(parsed.timestamp())
     lines = [
         "timestamp,symbol,side,size,price,tickDirection,trdMatchID,"
         "grossValue,homeNotional,foreignNotional,RPI"
     ]
-    for minute in range(minutes):
+    for minute in minute_offsets:
         timestamp = f"{start_seconds + minute * 60}.125"
         side = "Buy" if minute % 2 == 0 else "Sell"
         price = f"{100 + minute / 1000:.3f}"
@@ -101,6 +109,12 @@ def test_imports_streaming_bars_and_reuses_verified_day(
     assert manifest["coverage"]["individual_trades_retained"] is False
     assert manifest["coverage"]["orderbook_available"] is False
     assert manifest["coverage"]["synthetic_bars"] == 0
+    assert manifest["quality_policy"] == {
+        "maximum_consecutive_trade_free_minutes": 0,
+        "missing_minute_measure": "longest_consecutive_trade_free_run",
+        "parameters_key_retained_for_v1_compatibility": "maximum_missing_minutes",
+        "trade_free_minutes_are_explicit_gaps": True,
+    }
     assert manifest["sources"][0]["compressed_sha256"] == hashlib.sha256(payload).hexdigest()
     assert manifest["sources"][0]["source_retained"] is False
     assert (root / "catalog.json").is_file()
@@ -118,6 +132,25 @@ def test_imports_streaming_bars_and_reuses_verified_day(
     assert first_row["buy_volume"] == 0.5
     assert first_row["sell_volume"] == 0.0
 
+    symbol_manifest_path = (
+        first.dataset_path / "symbols" / "symbol=BTCUSDT" / "symbol-manifest.json"
+    )
+    legacy_symbol_manifest = json.loads(symbol_manifest_path.read_bytes())
+    del legacy_symbol_manifest["quality"]["longest_missing_minute_run"]
+    del legacy_symbol_manifest["quality"]["missing_minute_policy"]
+    symbol_manifest_path.write_text(
+        json.dumps(legacy_symbol_manifest, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    manifest.pop("quality_policy")
+    manifest["symbol_manifests"][0]["sha256"] = hashlib.sha256(
+        symbol_manifest_path.read_bytes()
+    ).hexdigest()
+    first.manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
     def unexpected_open(url: str, timeout_seconds: int) -> _FakeResponse:
         raise AssertionError(f"verified reuse must not download {url}/{timeout_seconds}")
 
@@ -134,6 +167,61 @@ def test_imports_streaming_bars_and_reuses_verified_day(
     assert second.output_fingerprint == first.output_fingerprint
 
 
+def test_accepts_many_isolated_trade_free_minutes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    partition_date = "2026-08-01"
+    omitted_minutes = set(range(30, 1_440, 60))
+    payload = _archive_payload_for_minutes(
+        partition_date,
+        (minute for minute in range(1_440) if minute not in omitted_minutes),
+    )
+    _install_archive(monkeypatch, payload)
+
+    result = import_bybit_history_day(
+        history_root=tmp_path / "history",
+        partition_date=partition_date,
+        symbols=("BTCUSDT",),
+        request_timeout_seconds=10,
+        download_attempts=1,
+        maximum_missing_minutes=1,
+    )
+
+    symbol_manifest = json.loads(
+        (result.dataset_path / "symbols" / "symbol=BTCUSDT" / "symbol-manifest.json").read_bytes()
+    )
+    assert symbol_manifest["quality"]["missing_minutes"] == len(omitted_minutes)
+    assert symbol_manifest["quality"]["longest_missing_minute_run"] == 1
+    assert symbol_manifest["quality"]["synthetic_bars"] == 0
+
+
+def test_rejects_a_long_consecutive_trade_free_gap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    partition_date = "2026-08-01"
+    payload = _archive_payload_for_minutes(
+        partition_date,
+        (minute for minute in range(1_440) if minute not in range(600, 606)),
+    )
+    _install_archive(monkeypatch, payload)
+
+    with pytest.raises(
+        HistoryImportError,
+        match=(
+            r"after 1 attempt\(s\).*longest trade-free gap of 6 minutes"
+            r".*total trade-free minutes: 6"
+        ),
+    ):
+        import_bybit_history_day(
+            history_root=tmp_path / "history",
+            partition_date=partition_date,
+            symbols=("BTCUSDT",),
+            request_timeout_seconds=10,
+            download_attempts=3,
+            maximum_missing_minutes=5,
+        )
+
+
 def test_failed_incomplete_day_resumes_from_staging(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -141,7 +229,7 @@ def test_failed_incomplete_day_resumes_from_staging(
     root = tmp_path / "history"
     _install_archive(monkeypatch, _archive_payload(partition_date, minutes=1_439))
 
-    with pytest.raises(HistoryImportError, match="missing 1 trade minutes"):
+    with pytest.raises(HistoryImportError, match="longest trade-free gap of 1 minutes"):
         import_bybit_history_day(
             history_root=root,
             partition_date=partition_date,

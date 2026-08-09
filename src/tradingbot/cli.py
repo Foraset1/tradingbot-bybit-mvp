@@ -398,7 +398,9 @@ def _config_summary(config: AppConfig) -> dict[str, object]:
             "root": str(config.history.root),
             "public_base_url": config.history.public_base_url,
             "assumed_latency_ms": config.history.assumed_latency_ms,
-            "maximum_missing_minutes": config.history.maximum_missing_minutes,
+            "maximum_consecutive_trade_free_minutes": (
+                config.history.maximum_missing_minutes
+            ),
             "profile": "price_futures_v1",
             "retains_individual_trades": False,
         },

@@ -55,7 +55,9 @@ https://public.bybit.com/trading/<SYMBOL>/<SYMBOL><YYYY-MM-DD>.csv.gz
 - исходный CSV обязан иметь неубывающие timestamps, правильный symbol, положительные
   price/size и уникальные соседние trade IDs;
 - синтетические бары запрещены;
-- до 5 минут без сделок в сутки остаются явными пропусками; больший разрыв отклоняет день;
+- минуты без сделок остаются явными пропусками и не превращаются в синтетические свечи;
+- архив отклоняется, если один непрерывный период без сделок превышает 5 минут; общее
+  количество разрозненных пустых минут сохраняется как метрика качества;
 - disk guard сохраняет минимум 15 GiB свободного места;
 - глобальный lock не даёт запустить два импортёра одновременно.
 
@@ -86,7 +88,7 @@ sudo docker compose exec collector python -m tradingbot validate-config \
 ```json
 {
   "assumed_latency_ms": 1000,
-  "maximum_missing_minutes": 5,
+  "maximum_consecutive_trade_free_minutes": 5,
   "profile": "price_futures_v1",
   "public_base_url": "https://public.bybit.com/trading",
   "retains_individual_trades": false,
@@ -95,6 +97,11 @@ sudo docker compose exec collector python -m tradingbot validate-config \
 ```
 
 Collector должен остаться `healthy`.
+
+В `config/tradingbot.toml` для совместимости manifest-схемы v1 этот предел пока хранится под
+историческим ключом `maximum_missing_minutes`. Его фактическая семантика — максимальное число
+**последовательных** минут без публичных сделок. Значение не ограничивает общую сумму отдельных
+пустых минут за сутки.
 
 ## Первый реальный день
 
