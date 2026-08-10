@@ -237,6 +237,23 @@ def _catalog_entries_fingerprint(entries: object) -> str:
     return _sha256_json(entries)
 
 
+def _cross_day_parameters(
+    manifest: dict[str, Any], *, partition_date: str
+) -> dict[str, Any]:
+    """Return import parameters that must remain stable across selected days."""
+
+    parameters = dict(_object(manifest.get("parameters"), "history day parameters"))
+    parameter_date = _partition_date(
+        parameters.get("partition_date"), "history day parameters.partition_date"
+    ).isoformat()
+    if parameter_date != partition_date:
+        raise ResearchBuildError(
+            f"history parameters partition date differs for {partition_date}"
+        )
+    del parameters["partition_date"]
+    return parameters
+
+
 def _history_file(
     day_path: Path,
     raw: object,
@@ -317,7 +334,7 @@ def _load_history_selection(
 
     days: list[_HistoryDay] = []
     expected_symbols: tuple[str, ...] | None = None
-    expected_parameters: str | None = None
+    expected_parameters: dict[str, Any] | None = None
     source_entries: list[dict[str, object]] = []
     for partition in selected_dates:
         entry = by_date[partition]
@@ -330,16 +347,24 @@ def _load_history_selection(
         try:
             validated = validate_history_day(
                 day_path,
-                expected_parameters_fingerprint=expected_parameters,
                 expected_symbols=expected_symbols,
             )
         except HistoryImportError as exc:
             raise ResearchBuildError(f"history day {partition} failed validation: {exc}") from exc
         if validated.partition_date != partition:
             raise ResearchBuildError(f"history day result differs for {partition}")
+        manifest = _load_json(manifest_path, "history day manifest")
+        comparable_parameters = _cross_day_parameters(
+            manifest, partition_date=partition
+        )
+        if expected_parameters is None:
+            expected_parameters = comparable_parameters
+        elif comparable_parameters != expected_parameters:
+            raise ResearchBuildError(
+                f"history day uses different cross-day import parameters: {partition}"
+            )
         if expected_symbols is None:
             expected_symbols = validated.symbols
-            expected_parameters = validated.parameters_fingerprint
             if BTC_SYMBOL not in expected_symbols:
                 raise ResearchBuildError("price research requires BTCUSDT context")
         manifest_sha = _sha256_file(manifest_path)
@@ -356,7 +381,6 @@ def _load_history_selection(
         raw_entry_symbols = entry.get("symbols")
         if raw_entry_symbols != list(validated.symbols):
             raise ResearchBuildError(f"catalog symbol list differs for {partition}")
-        manifest = _load_json(manifest_path, "history day manifest")
         raw_files = manifest.get("files")
         if not isinstance(raw_files, list):
             raise ResearchBuildError(f"history day {partition} has no files")
