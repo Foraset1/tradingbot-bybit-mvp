@@ -102,6 +102,54 @@ LOG1P_FEATURE_COLUMNS: Final = (
     "trade_notional_15m",
 )
 
+PRICE_DIRECT_FEATURE_COLUMNS: Final = (
+    "minute_bar_age_ms",
+    "trade_age_ms",
+    "return_1m_fraction",
+    "return_3m_fraction",
+    "return_5m_fraction",
+    "return_15m_fraction",
+    "return_60m_fraction",
+    "realized_volatility_5m_fraction",
+    "realized_volatility_15m_fraction",
+    "realized_volatility_60m_fraction",
+    "atr_14_bps",
+    "range_1m_bps",
+    "volume_ratio_5m_to_60m",
+    "trade_imbalance_5s",
+    "trade_return_5s_fraction",
+    "trade_imbalance_30s",
+    "trade_return_30s_fraction",
+    "trade_imbalance_1m",
+    "trade_return_1m_fraction",
+    "trade_imbalance_5m",
+    "trade_return_5m_fraction",
+    "trade_imbalance_15m",
+    "trade_return_15m_fraction",
+    "utc_hour_sin",
+    "utc_hour_cos",
+    "utc_weekday_sin",
+    "utc_weekday_cos",
+    "btc_return_5m_fraction",
+    "btc_return_15m_fraction",
+    "btc_return_60m_fraction",
+    "btc_realized_volatility_15m_fraction",
+    "btc_trade_imbalance_60s",
+    "relative_return_5m_fraction",
+    "relative_return_15m_fraction",
+    "relative_return_60m_fraction",
+)
+
+PRICE_LOG1P_FEATURE_COLUMNS: Final = tuple(
+    name
+    for suffix in ("5s", "30s", "1m", "5m", "15m")
+    for name in (
+        f"trade_count_{suffix}",
+        f"trade_base_volume_{suffix}",
+        f"trade_notional_{suffix}",
+    )
+)
+
 
 class EvaluationError(RuntimeError):
     """Raised when an offline evaluation would violate its integrity contract."""
@@ -165,6 +213,7 @@ class EvaluationParameters:
 class ResearchDataset:
     root: Path
     research_dataset_id: str
+    research_profile: str
     source_dataset_id: str
     input_fingerprint: str
     output_fingerprint: str

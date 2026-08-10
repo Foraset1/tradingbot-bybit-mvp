@@ -38,6 +38,7 @@ from tradingbot.research.contracts import (
     KLINE_RETURN_WINDOWS_MINUTES,
     KLINE_VOLATILITY_WINDOWS_MINUTES,
     LABEL_SCHEMA,
+    MICROSTRUCTURE_RESEARCH_PROFILE,
     PARQUET_COMPRESSION,
     PARQUET_COMPRESSION_LEVEL,
     PARQUET_FORMAT_VERSION,
@@ -1551,6 +1552,7 @@ def _build_research_dataset(
                 horizon_counts[f"{int(cast(int, row['horizon_minutes']))}m"] += 1
         manifest: dict[str, object] = {
             "research_schema_version": RESEARCH_SCHEMA_VERSION,
+            "research_profile": MICROSTRUCTURE_RESEARCH_PROFILE,
             "research_dataset_id": research_dataset_id,
             "input_fingerprint": input_fingerprint,
             "builder": {

@@ -15,12 +15,18 @@ from numpy.typing import NDArray
 from tradingbot.research.contracts import (
     FEATURE_SCHEMA,
     LABEL_SCHEMA,
+    MICROSTRUCTURE_RESEARCH_PROFILE,
+    PRICE_FEATURE_SCHEMA,
+    PRICE_LABEL_SCHEMA,
+    PRICE_RESEARCH_PROFILE,
     RESEARCH_SCHEMA_VERSION,
 )
 from tradingbot.research.evaluation_contracts import (
     DIRECT_FEATURE_COLUMNS,
     LOG1P_FEATURE_COLUMNS,
     OUTCOME_NAMES,
+    PRICE_DIRECT_FEATURE_COLUMNS,
+    PRICE_LOG1P_FEATURE_COLUMNS,
     EvaluationError,
     PreparedData,
     ResearchDataset,
@@ -100,6 +106,24 @@ def validate_research_dataset(dataset_path: str | Path) -> ResearchDataset:
     manifest = _load_json(root / "manifest.json", "research manifest")
     if manifest.get("research_schema_version") != RESEARCH_SCHEMA_VERSION:
         raise EvaluationError("research dataset uses an unsupported schema version")
+    raw_profile = manifest.get("research_profile", MICROSTRUCTURE_RESEARCH_PROFILE)
+    research_profile = _string(raw_profile, "research_profile")
+    if research_profile == MICROSTRUCTURE_RESEARCH_PROFILE:
+        feature_schema = FEATURE_SCHEMA
+        label_schema = LABEL_SCHEMA
+        expected_feature_rule = "received_at_ns <= decision_at_ns"
+        expected_label_rule = (
+            "decision_at_ns < trade.received_at_ns <= label_end_ns"
+        )
+    elif research_profile == PRICE_RESEARCH_PROFILE:
+        feature_schema = PRICE_FEATURE_SCHEMA
+        label_schema = PRICE_LABEL_SCHEMA
+        expected_feature_rule = "available_at_ns <= decision_at_ns"
+        expected_label_rule = (
+            "decision_at_ns < trade_bar_1s.available_at_ns <= label_end_ns"
+        )
+    else:
+        raise EvaluationError(f"unsupported research profile: {research_profile}")
     dataset_id = _string(manifest.get("research_dataset_id"), "research_dataset_id")
     if root.name != dataset_id:
         raise EvaluationError("research dataset ID does not match its directory")
@@ -109,11 +133,9 @@ def validate_research_dataset(dataset_path: str | Path) -> ResearchDataset:
     )
 
     causality = _object(manifest.get("causality"), "causality")
-    if causality.get("feature_rule") != "received_at_ns <= decision_at_ns":
+    if causality.get("feature_rule") != expected_feature_rule:
         raise EvaluationError("research feature causality contract is missing")
-    if causality.get("label_rule") != (
-        "decision_at_ns < trade.received_at_ns <= label_end_ns"
-    ):
+    if causality.get("label_rule") != expected_label_rule:
         raise EvaluationError("research label causality contract is missing")
     if causality.get("execution_labels_included") is not False:
         raise EvaluationError("research dataset unexpectedly claims execution labels")
@@ -121,9 +143,9 @@ def validate_research_dataset(dataset_path: str | Path) -> ResearchDataset:
         raise EvaluationError("research dataset unexpectedly claims maker fills")
 
     schemas = _object(manifest.get("schemas"), "schemas")
-    if schemas.get("features") != _schema_manifest(FEATURE_SCHEMA):
+    if schemas.get("features") != _schema_manifest(feature_schema):
         raise EvaluationError("research feature schema manifest is inconsistent")
-    if schemas.get("labels") != _schema_manifest(LABEL_SCHEMA):
+    if schemas.get("labels") != _schema_manifest(label_schema):
         raise EvaluationError("research label schema manifest is inconsistent")
 
     source = _object(manifest.get("source"), "source")
@@ -188,7 +210,7 @@ def validate_research_dataset(dataset_path: str | Path) -> ResearchDataset:
         actual = root.joinpath(*relative.parts).resolve()
         if not actual.is_relative_to(root) or not actual.is_file():
             raise EvaluationError(f"research output file is missing: {relative}")
-        expected_schema = FEATURE_SCHEMA if table_name == "features" else LABEL_SCHEMA
+        expected_schema = feature_schema if table_name == "features" else label_schema
         if actual.stat().st_size != size or _sha256_file(actual) != digest:
             raise EvaluationError(f"research output file is corrupted: {relative}")
         try:
@@ -233,6 +255,7 @@ def validate_research_dataset(dataset_path: str | Path) -> ResearchDataset:
     return ResearchDataset(
         root=root,
         research_dataset_id=dataset_id,
+        research_profile=research_profile,
         source_dataset_id=source_dataset_id,
         input_fingerprint=input_fingerprint,
         output_fingerprint=output_fingerprint,
@@ -280,7 +303,17 @@ def prepare_evaluation_data(
 
     if horizon_minutes not in {5, 15, 30, 60}:
         raise EvaluationError("horizon_minutes must be one of 5, 15, 30, or 60")
-    model_columns = list(dict.fromkeys(DIRECT_FEATURE_COLUMNS + LOG1P_FEATURE_COLUMNS))
+    direct_feature_columns: tuple[str, ...]
+    log1p_feature_columns: tuple[str, ...]
+    if dataset.research_profile == PRICE_RESEARCH_PROFILE:
+        direct_feature_columns = PRICE_DIRECT_FEATURE_COLUMNS
+        log1p_feature_columns = PRICE_LOG1P_FEATURE_COLUMNS
+    else:
+        direct_feature_columns = DIRECT_FEATURE_COLUMNS
+        log1p_feature_columns = LOG1P_FEATURE_COLUMNS
+    model_columns = list(
+        dict.fromkeys(direct_feature_columns + log1p_feature_columns)
+    )
     feature_columns = [
         "decision_id",
         "symbol",
@@ -389,8 +422,8 @@ def prepare_evaluation_data(
         raise EvaluationError("joined data contains an unsupported outcome")
 
     feature_names = (
-        *DIRECT_FEATURE_COLUMNS,
-        *(f"log1p_{name}" for name in LOG1P_FEATURE_COLUMNS),
+        *direct_feature_columns,
+        *(f"log1p_{name}" for name in log1p_feature_columns),
         "stop_distance_bps",
         "take_profit_distance_bps",
         "side_direction",
@@ -398,13 +431,13 @@ def prepare_evaluation_data(
     )
     x = np.empty((rows, len(feature_names)), dtype=np.float32)
     column_index = 0
-    for name in DIRECT_FEATURE_COLUMNS:
+    for name in direct_feature_columns:
         values = _float_array(joined, name)
         if np.any(np.isinf(values)):
             raise EvaluationError(f"model feature contains infinity: {name}")
         x[:, column_index] = values.astype(np.float32)
         column_index += 1
-    for name in LOG1P_FEATURE_COLUMNS:
+    for name in log1p_feature_columns:
         values = _float_array(joined, name)
         if np.any(np.isinf(values)) or np.any(values[~np.isnan(values)] < 0):
             raise EvaluationError(f"log1p model feature is invalid: {name}")
@@ -438,8 +471,12 @@ def prepare_evaluation_data(
     gross_returns = _float_array(joined, "outcome_return_bps")
     if np.any(~np.isfinite(gross_returns)):
         raise EvaluationError("priced label returns must be finite")
-    funding_rate = _float_array(joined, "funding_rate")
-    minutes_to_funding = _float_array(joined, "minutes_to_funding")
+    if dataset.research_profile == PRICE_RESEARCH_PROFILE:
+        funding_rate = np.full(rows, np.nan, dtype=np.float64)
+        minutes_to_funding = np.full(rows, np.nan, dtype=np.float64)
+    else:
+        funding_rate = _float_array(joined, "funding_rate")
+        minutes_to_funding = _float_array(joined, "minutes_to_funding")
     if np.any(np.isinf(funding_rate)) or np.any(np.isinf(minutes_to_funding)):
         raise EvaluationError("funding features contain infinity")
 

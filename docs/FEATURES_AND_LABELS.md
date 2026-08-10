@@ -9,6 +9,17 @@
 Система остаётся полностью read-only. Здесь нет API-ключей, ордеров, позиции, оценки
 maker fill или решения «торговать».
 
+Существуют два несовместимых по входным данным, но совместимых с offline evaluator
+research-профиля:
+
+- `microstructure_research_v1` — live orderbook/trades/ticker/kline с локальными
+  `received_at_ns`;
+- `price_futures_research_v1` — официальные 1s/1m trade-bars с консервативными
+  `available_at_ns`, без стакана, spread, funding и OI.
+
+Второй профиль строится командой `build-price-research`; отсутствующие признаки не входят
+в его Arrow-схему и модель, а не заполняются искусственными нулями.
+
 ## Входной gate
 
 `build-research` принимает либо один dataset, созданный `build-dataset`, либо

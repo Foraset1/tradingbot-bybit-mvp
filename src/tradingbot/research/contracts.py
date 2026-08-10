@@ -7,6 +7,8 @@ from typing import Final
 import pyarrow as pa  # type: ignore[import-untyped]
 
 RESEARCH_SCHEMA_VERSION: Final = 1
+MICROSTRUCTURE_RESEARCH_PROFILE: Final = "microstructure_research_v1"
+PRICE_RESEARCH_PROFILE: Final = "price_futures_research_v1"
 PARQUET_FORMAT_VERSION: Final = "2.6"
 PARQUET_COMPRESSION: Final = "zstd"
 PARQUET_COMPRESSION_LEVEL: Final = 3
@@ -77,6 +79,67 @@ class ResearchParameters:
             "kline_history_minutes": self.kline_history_minutes,
             "max_orderbook_age_ms": self.max_orderbook_age_ms,
             "max_ticker_age_ms": self.max_ticker_age_ms,
+            "label_horizons_minutes": list(self.label_horizons_minutes),
+            "volatility_lookback_minutes": self.volatility_lookback_minutes,
+            "stop_volatility_multiple": self.stop_volatility_multiple,
+            "take_profit_multiple": self.take_profit_multiple,
+            "minimum_stop_bps": self.minimum_stop_bps,
+            "maximum_stop_bps": self.maximum_stop_bps,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class PriceResearchParameters:
+    """Versioned parameters for research built from official trade-bar history."""
+
+    decision_interval_seconds: int = 60
+    decision_offset_seconds: int = 5
+    kline_history_minutes: int = 60
+    maximum_trade_age_ms: int = 10_000
+    label_horizons_minutes: tuple[int, ...] = DEFAULT_LABEL_HORIZONS_MINUTES
+    volatility_lookback_minutes: int = 60
+    stop_volatility_multiple: float = 1.0
+    take_profit_multiple: float = 1.5
+    minimum_stop_bps: float = 10.0
+    maximum_stop_bps: float = 250.0
+
+    def validate(self) -> None:
+        if self.decision_interval_seconds <= 0:
+            raise ResearchBuildError("decision_interval_seconds must be positive")
+        if not 0 <= self.decision_offset_seconds < self.decision_interval_seconds:
+            raise ResearchBuildError(
+                "decision_offset_seconds must be within the decision interval"
+            )
+        if self.kline_history_minutes < max(KLINE_RETURN_WINDOWS_MINUTES):
+            raise ResearchBuildError(
+                "kline_history_minutes is too short for the price feature contract"
+            )
+        if self.maximum_trade_age_ms <= 0:
+            raise ResearchBuildError("maximum_trade_age_ms must be positive")
+        if (
+            not self.label_horizons_minutes
+            or tuple(sorted(set(self.label_horizons_minutes)))
+            != self.label_horizons_minutes
+            or any(value <= 0 for value in self.label_horizons_minutes)
+        ):
+            raise ResearchBuildError(
+                "label_horizons_minutes must be unique, positive, and sorted"
+            )
+        if not 2 <= self.volatility_lookback_minutes <= self.kline_history_minutes:
+            raise ResearchBuildError(
+                "volatility_lookback_minutes must be within the minute history"
+            )
+        if self.stop_volatility_multiple <= 0 or self.take_profit_multiple <= 0:
+            raise ResearchBuildError("barrier volatility multiples must be positive")
+        if self.minimum_stop_bps <= 0 or self.maximum_stop_bps < self.minimum_stop_bps:
+            raise ResearchBuildError("stop barrier bounds are invalid")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "decision_interval_seconds": self.decision_interval_seconds,
+            "decision_offset_seconds": self.decision_offset_seconds,
+            "kline_history_minutes": self.kline_history_minutes,
+            "maximum_trade_age_ms": self.maximum_trade_age_ms,
             "label_horizons_minutes": list(self.label_horizons_minutes),
             "volatility_lookback_minutes": self.volatility_lookback_minutes,
             "stop_volatility_multiple": self.stop_volatility_multiple,
@@ -274,4 +337,83 @@ LABEL_SCHEMA: Final = pa.schema(
         _required("resolution", pa.string()),
     ),
     metadata=_RESEARCH_METADATA,
+)
+
+
+_PRICE_RESEARCH_METADATA: Final = {
+    b"tradingbot.research_schema_version": str(RESEARCH_SCHEMA_VERSION).encode(
+        "ascii"
+    ),
+    b"tradingbot.research_profile": PRICE_RESEARCH_PROFILE.encode("ascii"),
+    b"tradingbot.feature_cutoff": b"available_at_ns <= decision_at_ns",
+    b"tradingbot.execution_labels": b"not_included",
+}
+
+_PRICE_FEATURE_FIELDS: list[pa.Field] = [
+    _required("research_schema_version", pa.int32()),
+    _required("decision_id", pa.string()),
+    _required("source_dataset_id", pa.string()),
+    _required("symbol", pa.string()),
+    _required("decision_at_ns", pa.int64()),
+    _required("decision_at_ms", pa.int64()),
+    _required("decision_utc_date", pa.string()),
+    _required("latest_minute_bar_available_at_ns", pa.int64()),
+    pa.field("latest_second_bar_available_at_ns", pa.int64()),
+    _required("minute_bar_age_ms", pa.float64()),
+    pa.field("trade_age_ms", pa.float64()),
+    _required("reference_price", pa.float64()),
+    _required("close_price", pa.float64()),
+]
+
+_PRICE_FEATURE_FIELDS.extend(
+    _required(f"return_{window}m_fraction", pa.float64())
+    for window in KLINE_RETURN_WINDOWS_MINUTES
+)
+_PRICE_FEATURE_FIELDS.extend(
+    _required(f"realized_volatility_{window}m_fraction", pa.float64())
+    for window in KLINE_VOLATILITY_WINDOWS_MINUTES
+)
+_PRICE_FEATURE_FIELDS.extend(
+    (
+        _required("atr_14_bps", pa.float64()),
+        _required("range_1m_bps", pa.float64()),
+        _required("volume_ratio_5m_to_60m", pa.float64()),
+    )
+)
+
+for _seconds in TRADE_WINDOWS_SECONDS:
+    _suffix = f"{_seconds}s" if _seconds < 60 else f"{_seconds // 60}m"
+    _PRICE_FEATURE_FIELDS.extend(
+        (
+            _required(f"trade_count_{_suffix}", pa.int64()),
+            _required(f"trade_base_volume_{_suffix}", pa.float64()),
+            _required(f"trade_notional_{_suffix}", pa.float64()),
+            _required(f"trade_imbalance_{_suffix}", pa.float64()),
+            _required(f"trade_return_{_suffix}_fraction", pa.float64()),
+        )
+    )
+
+_PRICE_FEATURE_FIELDS.extend(
+    (
+        _required("utc_hour_sin", pa.float64()),
+        _required("utc_hour_cos", pa.float64()),
+        _required("utc_weekday_sin", pa.float64()),
+        _required("utc_weekday_cos", pa.float64()),
+        pa.field("btc_return_5m_fraction", pa.float64()),
+        pa.field("btc_return_15m_fraction", pa.float64()),
+        pa.field("btc_return_60m_fraction", pa.float64()),
+        pa.field("btc_realized_volatility_15m_fraction", pa.float64()),
+        pa.field("btc_trade_imbalance_60s", pa.float64()),
+        pa.field("relative_return_5m_fraction", pa.float64()),
+        pa.field("relative_return_15m_fraction", pa.float64()),
+        pa.field("relative_return_60m_fraction", pa.float64()),
+    )
+)
+
+PRICE_FEATURE_SCHEMA: Final = pa.schema(
+    _PRICE_FEATURE_FIELDS, metadata=_PRICE_RESEARCH_METADATA
+)
+
+PRICE_LABEL_SCHEMA: Final = pa.schema(
+    tuple(LABEL_SCHEMA), metadata=_PRICE_RESEARCH_METADATA
 )

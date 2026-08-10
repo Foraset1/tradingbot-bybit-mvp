@@ -141,11 +141,21 @@ tradingbot import-history \
   --to-date 2026-08-02
 ```
 
-Команда строит 1s/1m trade-bars и проверяемый `/data/history/catalog.json`. Она не создаёт
-стакан, ticker, funding или open interest и пока не является входом существующего
-microstructure `build-research`. Минуты без публичных сделок сохраняются как явные gaps;
-защитный лимит применяется к самому длинному непрерывному trade-free интервалу, а не к
-общему количеству разрозненных пустых минут за сутки.
+Команда строит 1s/1m trade-bars и проверяемый `/data/history/catalog.json`. Отдельный
+price-only research dataset создаётся без выдуманных book/funding/OI-признаков:
+
+```bash
+tradingbot build-price-research \
+  --catalog data/history/catalog.json \
+  --from-date 2026-05-10 \
+  --to-date 2026-08-07 \
+  --output-root data/research
+```
+
+Профиль `price_futures_research_v1` совместим с `run-backtest`, но не моделирует стакан,
+spread, funding, maker queue или partial fills. Минуты без публичных сделок сохраняются как
+явные gaps; защитный лимит применяется к самому длинному непрерывному trade-free интервалу,
+а не к общему количеству разрозненных пустых минут за сутки.
 
 ## Формат данных
 
