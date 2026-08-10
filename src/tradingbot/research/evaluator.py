@@ -24,6 +24,7 @@ from tradingbot.research.backtest import (
     expected_net_returns_bps,
     run_one_position_backtest,
 )
+from tradingbot.research.contracts import PRICE_RESEARCH_PROFILE
 from tradingbot.research.evaluation_contracts import (
     EVALUATION_SCHEMA_VERSION,
     NS_PER_DAY,
@@ -311,7 +312,18 @@ def run_offline_evaluation(
             if all(fold.mode == "walk_forward" for fold in folds)
             else "technical_smoke"
         )
-        history_gate_met = data_span_days >= parameters.acceptance_minimum_days
+        source_coverage_days: int | None = None
+        if dataset.research_profile == PRICE_RESEARCH_PROFILE:
+            source = dataset.manifest.get("source")
+            raw_days = source.get("days") if isinstance(source, dict) else None
+            if isinstance(raw_days, int) and not isinstance(raw_days, bool) and raw_days > 0:
+                source_coverage_days = raw_days
+        gate_coverage_days = (
+            float(source_coverage_days)
+            if source_coverage_days is not None
+            else data_span_days
+        )
+        history_gate_met = gate_coverage_days >= parameters.acceptance_minimum_days
 
         prediction_batches: list[PredictionBatch] = []
         fold_reports: list[dict[str, object]] = []
@@ -422,6 +434,7 @@ def run_offline_evaluation(
             "environment": environment,
             "research_dataset": {
                 "research_dataset_id": dataset.research_dataset_id,
+                "research_profile": dataset.research_profile,
                 "source_dataset_id": dataset.source_dataset_id,
                 "input_fingerprint": dataset.input_fingerprint,
                 "output_fingerprint": dataset.output_fingerprint,
@@ -445,6 +458,8 @@ def run_offline_evaluation(
             "data_gate": {
                 "mode": data_mode,
                 "data_span_days": data_span_days,
+                "source_coverage_days": source_coverage_days,
+                "gate_coverage_days": gate_coverage_days,
                 "required_days_for_market_model_review": (
                     parameters.acceptance_minimum_days
                 ),
@@ -454,16 +469,28 @@ def run_offline_evaluation(
                 ),
                 "eligible_for_profitability_conclusion": False,
                 "reason": (
-                    "maker fill, queue position, and partial execution are not modeled"
+                    (
+                        "price-only history also lacks order book, spread, funding, and "
+                        "open interest; maker fill, queue position, and partial execution "
+                        "are not modeled"
+                    )
+                    if dataset.research_profile == PRICE_RESEARCH_PROFILE
+                    else (
+                        "maker fill, queue position, and partial execution are not modeled"
+                    )
                 ),
             },
             "scope": {
                 "bybit_access": "public-read-only",
+                "research_profile": dataset.research_profile,
                 "order_submission": False,
                 "conditional_entry_assumption": True,
                 "maker_fill_modeled": False,
                 "queue_position_modeled": False,
                 "partial_fill_modeled": False,
+                "funding_history_available": (
+                    dataset.research_profile != PRICE_RESEARCH_PROFILE
+                ),
                 "openai_tokens": 0,
             },
         }

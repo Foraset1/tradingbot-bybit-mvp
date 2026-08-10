@@ -56,6 +56,20 @@ jq . "$REPORT_DIR/backtest-build-result.json"
 sudo chown foraset1:foraset1 "$REPORT_DIR/backtest-build-result.json"
 ```
 
+Для результата `build-price-research` путь лучше брать прямо из сохранённого JSON, не
+угадывая fingerprint:
+
+```bash
+PRICE_RESULT=/home/foraset1/tradingbot-reports/price-research-90d-2026-08-07.json
+RESEARCH_DATASET=$(jq -er '.dataset_path' "$PRICE_RESULT")
+
+sudo docker compose run --rm --no-deps collector \
+  python -m tradingbot run-backtest \
+  --research-dataset "$RESEARCH_DATASET" \
+  --output-root /data/evaluations \
+  > /home/foraset1/tradingbot-reports/backtest-price-90d-2026-08-07.json
+```
+
 Для первого технического smoke-test можно использовать уже созданный snapshot. Для нового
 72-часового snapshot сначала нужно повторить strict audit, `build-dataset` и
 `build-research`; нельзя дописывать данные в уже созданный versioned dataset.
@@ -134,6 +148,11 @@ sudo chown foraset1:foraset1 \
 Перед финансовой интерпретацией комиссии нужно заменить на фактический тариф аккаунта.
 Текущий backtest условно предполагает, что выбранный maker-вход исполнился. Он не выдаёт
 `NO_FILL`, не оценивает queue position и не заявляет реальную maker fill rate.
+
+Для `price_futures_research_v1` дополнительно отсутствует история funding: соответствующие
+значения остаются неизвестными (`NaN`) и не включаются в модель, а funding cost в таком
+предварительном backtest равен нулю. Поэтому даже 90-дневный положительный результат этого
+профиля нельзя трактовать как оценку чистой реальной доходности.
 
 ## Что прислать для проверки
 

@@ -41,9 +41,10 @@ https://public.bybit.com/trading/<SYMBOL>/<SYMBOL><YYYY-MM-DD>.csv.gz
 1 секунда), а manifest содержит
 `timestamp_basis: bar_end_plus_assumed_latency`.
 
-Текущий `build-research` ожидает полный microstructure-профиль и пока не принимает
-`/data/history/catalog.json`. Для `price_futures_v1` будет отдельный causal builder. До его
-добавления импорт можно безопасно выполнять параллельно с live-сбором.
+Обычный `build-research` по-прежнему ожидает полный microstructure-профиль. Для
+`/data/history/catalog.json` используется отдельная команда `build-price-research`: она
+не подменяет отсутствующие поля нулями и создаёт профиль `price_futures_research_v1`.
+Импорт и построение research dataset можно безопасно выполнять параллельно с live-сбором.
 
 ## Защита данных
 
@@ -208,16 +209,49 @@ jq '{entry_count, catalog_fingerprint}' \
 dry-run плана удаления старого raw. При приближении к 15 GiB свободного места импорт
 остановится безопасно.
 
-## Следующий этап
+## Построение price-only research dataset
 
-После успешного 7-дневного отчёта:
+После успешного импорта выбранного диапазона запускается отдельный причинный builder.
+Диапазон указывается явно, поэтому последующее добавление дней в `catalog.json` не меняет
+уже созданный dataset:
 
-1. добавить causal research builder для `price_futures_v1`;
-2. использовать 1m bars для признаков и 1s bars для triple-barrier labels;
-3. явно помечать недоступные book/ticker/OI/funding признаки как отсутствующие, а не нули;
-4. проверить технический backtest на 30 дня;
-5. загрузить 12–24 месяца только после замера диска и скорости;
-6. сравнить price-only baseline с моделью на собственном live L2 после накопления истории.
+```bash
+set +e
+cd /opt/tradingbot
+
+REPORT_DIR=/home/foraset1/tradingbot-reports
+REPORT="$REPORT_DIR/price-research-90d-2026-08-07.json"
+LOG="$REPORT_DIR/price-research-90d-2026-08-07.log"
+
+sudo docker compose run --rm --no-deps collector \
+  python -m tradingbot build-price-research \
+  --catalog /data/history/catalog.json \
+  --from-date 2026-05-10 \
+  --to-date 2026-08-07 \
+  --output-root /data/research \
+  > "$REPORT" 2> "$LOG"
+
+STATUS=$?
+sudo chown foraset1:foraset1 "$REPORT" "$LOG"
+echo "exit=$STATUS"
+jq . "$REPORT"
+grep -Ei 'warning|error|traceback' "$LOG" || true
+```
+
+Builder повторно проверяет SHA-256 каждого выбранного history-файла, использует только
+бары с `available_at_ns <= decision_at_ns`, строит признаки по 1m/1s bars и labels
+5/15/30/60 минут. Одновременное пересечение TP и SL внутри одной секундной свечи получает
+`AMBIGUOUS`, потому что порядок исходных сделок после агрегации неизвестен.
+
+Результат можно передать существующему `run-backtest`. В отчёте профиль будет явно указан
+как price-only; funding, стакан, spread, maker queue и partial fills останутся недоступными.
+
+Следующие шаги после первого 90-дневного backtest:
+
+1. проверить walk-forward folds и стабильность результата отдельно по каждой паре;
+2. при достаточном свободном месте расширить price history до 12–24 месяцев;
+3. сравнить price-only baseline с моделью на собственном live L2;
+4. отдельно построить maker execution simulator и затем перейти к Demo/Shadow Mode.
 
 Даже секундные bars не моделируют maker queue. Переход к Demo/Shadow Mode и отдельный
 execution simulator остаются обязательными.

@@ -117,6 +117,32 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="Research dataset parent directory (defaults to research beside storage.root)",
     )
+    price_research = subparsers.add_parser(
+        "build-price-research",
+        help="Build causal price-only research from official Bybit history",
+    )
+    price_research.add_argument(
+        "--catalog",
+        type=Path,
+        required=True,
+        help="Verified /data/history/catalog.json",
+    )
+    price_research.add_argument(
+        "--from-date",
+        required=True,
+        help="First imported UTC day to select (YYYY-MM-DD, inclusive)",
+    )
+    price_research.add_argument(
+        "--to-date",
+        required=True,
+        help="Last imported UTC day to select (YYYY-MM-DD, inclusive)",
+    )
+    price_research.add_argument(
+        "--output-root",
+        type=Path,
+        default=None,
+        help="Research dataset parent directory (defaults to research beside storage.root)",
+    )
     evaluation = subparsers.add_parser(
         "run-backtest",
         help="Run causal baselines, LightGBM, and a conditional-entry market backtest",
@@ -509,6 +535,46 @@ def _run_build_research(
     print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
 
 
+def _run_build_price_research(
+    config: AppConfig,
+    catalog: Path,
+    start_date: str,
+    end_date: str,
+    output_root: Path | None,
+) -> None:
+    try:
+        from tradingbot.research.contracts import ResearchBuildError
+        from tradingbot.research.price_history_builder import (
+            build_price_research_dataset,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name in {"numpy", "pyarrow"} or (exc.name or "").startswith(
+            ("numpy.", "pyarrow.")
+        ):
+            LOGGER.error(
+                "Price research support is not installed; install the project with "
+                "the [research] extra"
+            )
+            raise SystemExit(1) from exc
+        raise
+
+    destination = (
+        config.storage.root.parent / "research" if output_root is None else output_root
+    )
+    try:
+        result = build_price_research_dataset(
+            history_catalog=catalog,
+            output_root=destination,
+            start_date=start_date,
+            end_date=end_date,
+            minimum_free_bytes=config.storage.min_free_bytes,
+        )
+    except ResearchBuildError as exc:
+        LOGGER.error("Price research build rejected: %s", exc)
+        raise SystemExit(1) from exc
+    print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+
+
 def _run_backtest(
     config: AppConfig,
     research_dataset: Path,
@@ -742,6 +808,15 @@ def main(argv: Sequence[str] | None = None) -> None:
             config,
             args.dataset,
             args.catalog,
+            args.output_root,
+        )
+        return
+    if args.command == "build-price-research":
+        _run_build_price_research(
+            config,
+            args.catalog,
+            args.from_date,
+            args.to_date,
             args.output_root,
         )
         return
