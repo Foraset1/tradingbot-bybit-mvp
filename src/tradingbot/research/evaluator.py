@@ -16,6 +16,7 @@ import numpy as np
 import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 import sklearn  # type: ignore[import-untyped]
+from numpy.typing import NDArray
 
 from tradingbot import __version__
 from tradingbot.config import AppConfig
@@ -25,24 +26,30 @@ from tradingbot.research.backtest import (
     run_one_position_backtest,
 )
 from tradingbot.research.contracts import PRICE_RESEARCH_PROFILE
+from tradingbot.research.diagnostics import trade_diagnostics
 from tradingbot.research.evaluation_contracts import (
     EVALUATION_SCHEMA_VERSION,
+    FEATURE_PROFILES,
     NS_PER_DAY,
     EvaluationError,
     EvaluationParameters,
     EvaluationResult,
     PredictionBatch,
+    PreparedData,
 )
 from tradingbot.research.evaluation_dataset import (
+    build_symbol_quality_gate,
+    feature_profile_indices,
     prepare_evaluation_data,
     validate_research_dataset,
 )
 from tradingbot.research.models import (
     classification_metrics,
     fit_fold_models,
+    fit_probability_calibrator,
     timeout_return_estimate,
 )
-from tradingbot.research.splits import build_temporal_folds
+from tradingbot.research.splits import build_calibration_split, build_temporal_folds
 
 LOGGER = logging.getLogger(__name__)
 
@@ -59,6 +66,9 @@ TRADE_SCHEMA = pa.schema(
         pa.field("probability_timeout", pa.float64(), nullable=False),
         pa.field("probability_tp_first", pa.float64(), nullable=False),
         pa.field("expected_net_bps", pa.float64(), nullable=False),
+        pa.field("candidate_count", pa.int32(), nullable=False),
+        pa.field("eligible_candidate_count", pa.int32(), nullable=False),
+        pa.field("expected_margin_to_second_bps", pa.float64(), nullable=True),
         pa.field("gross_return_bps", pa.float64(), nullable=False),
         pa.field("fee_bps", pa.float64(), nullable=False),
         pa.field("slippage_bps", pa.float64(), nullable=False),
@@ -88,6 +98,11 @@ def evaluation_parameters(config: AppConfig) -> EvaluationParameters:
         acceptance_minimum_days=selected.acceptance_minimum_days,
         minimum_train_rows=selected.minimum_train_rows,
         minimum_test_rows=selected.minimum_test_rows,
+        calibration_days=selected.calibration_days,
+        minimum_calibration_rows=selected.minimum_calibration_rows,
+        minimum_symbol_coverage_fraction=(
+            selected.minimum_symbol_coverage_fraction
+        ),
         maker_fee_bps=selected.maker_fee_bps,
         taker_fee_bps=selected.taker_fee_bps,
         entry_adverse_selection_bps=selected.entry_adverse_selection_bps,
@@ -104,6 +119,16 @@ def evaluation_parameters(config: AppConfig) -> EvaluationParameters:
         max_planned_risk_fraction=config.risk.max_planned_risk_fraction,
         rolling_24h_loss_fraction=config.risk.rolling_24h_loss_fraction,
     )
+
+
+def _matrix_view(
+    data: PreparedData,
+    rows: NDArray[np.int64],
+    columns: NDArray[np.int64],
+) -> NDArray[np.float32]:
+    if len(columns) == data.x.shape[1]:
+        return data.x[rows]
+    return data.x[np.ix_(rows, columns)]
 
 
 def _sha256_file(path: Path) -> str:
@@ -298,9 +323,25 @@ def run_offline_evaluation(
     staging = destination_root / f".{experiment_id}.tmp-{uuid.uuid4().hex}"
     staging.mkdir()
     try:
-        data = prepare_evaluation_data(
-            dataset, horizon_minutes=parameters.horizon_minutes
+        eligible_symbols, symbol_quality_gate = build_symbol_quality_gate(
+            dataset,
+            minimum_coverage_fraction=(
+                parameters.minimum_symbol_coverage_fraction
+            ),
         )
+        data = prepare_evaluation_data(
+            dataset,
+            horizon_minutes=parameters.horizon_minutes,
+            allowed_symbols=eligible_symbols,
+        )
+        profile_columns = {
+            profile: feature_profile_indices(data.feature_names, profile)
+            for profile in FEATURE_PROFILES
+        }
+        profile_feature_names = {
+            profile: tuple(data.feature_names[int(index)] for index in columns)
+            for profile, columns in profile_columns.items()
+        }
         folds = build_temporal_folds(data, parameters)
         data_span_days = (
             int(np.max(data.decision_at_ns))
@@ -329,50 +370,155 @@ def run_offline_evaluation(
         fold_reports: list[dict[str, object]] = []
         model_files: list[Path] = []
         importance_by_model: dict[str, list[np.ndarray[Any, Any]]] = defaultdict(list)
+        importance_names: dict[str, tuple[str, ...]] = {}
+        model_metadata: dict[str, dict[str, object]] = {}
         models_root = staging / "models"
         models_root.mkdir()
         for fold in folds:
-            train = fold.train_indices
+            calibration_split = build_calibration_split(data, fold, parameters)
+            fit = calibration_split.fit_indices
+            calibration = calibration_split.calibration_indices
             test = fold.test_indices
-            outputs = fit_fold_models(
-                data.x[train], data.y[train], data.x[test], parameters
-            )
             timeout_estimate = timeout_return_estimate(
-                y_train=data.y[train],
-                returns_train=data.outcome_return_bps[train],
-                symbols_train=data.symbol_codes[train],
-                sides_train=data.side_codes[train],
+                y_train=data.y[fit],
+                returns_train=data.outcome_return_bps[fit],
+                symbols_train=data.symbol_codes[fit],
+                sides_train=data.side_codes[fit],
                 symbols_test=data.symbol_codes[test],
                 sides_test=data.side_codes[test],
             )
-            model_reports: dict[str, object] = {}
-            for output in outputs:
-                expected = expected_net_returns_bps(
-                    data,
-                    test,
-                    output.probabilities,
-                    timeout_estimate,
+            profile_reports: dict[str, object] = {}
+            for profile in FEATURE_PROFILES:
+                columns = profile_columns[profile]
+                outputs = fit_fold_models(
+                    _matrix_view(data, fit, columns),
+                    data.y[fit],
+                    _matrix_view(data, calibration, columns),
+                    _matrix_view(data, test, columns),
                     parameters,
                 )
-                prediction_batches.append(
-                    PredictionBatch(
-                        model_name=output.name,
-                        fold=fold.fold,
-                        row_indices=test,
-                        probabilities=output.probabilities,
-                        expected_net_bps=expected,
+                profile_model_reports: dict[str, object] = {}
+                for output in outputs:
+                    if output.name == "class_prior" and profile != "full":
+                        continue
+                    if output.name == "class_prior":
+                        model_name = "class_prior"
+                        expected = expected_net_returns_bps(
+                            data,
+                            test,
+                            output.probabilities,
+                            timeout_estimate,
+                            parameters,
+                        )
+                        prediction_batches.append(
+                            PredictionBatch(
+                                model_name=model_name,
+                                fold=fold.fold,
+                                row_indices=test,
+                                probabilities=output.probabilities,
+                                expected_net_bps=expected,
+                            )
+                        )
+                        model_metadata[model_name] = {
+                            "base_model": output.name,
+                            "feature_profile": None,
+                            "probability_variant": "raw",
+                        }
+                        profile_model_reports[output.name] = {
+                            "raw": {
+                                "calibration_window": classification_metrics(
+                                    data.y[calibration],
+                                    output.calibration_probabilities,
+                                ),
+                                "outer_test": classification_metrics(
+                                    data.y[test], output.probabilities
+                                ),
+                            }
+                        }
+                        continue
+
+                    calibrator = fit_probability_calibrator(
+                        output.calibration_probabilities,
+                        data.y[calibration],
                     )
-                )
-                model_reports[output.name] = classification_metrics(
-                    data.y[test], output.probabilities
-                )
-                if output.feature_importance is not None:
-                    importance_by_model[output.name].append(output.feature_importance)
-                if output.model_text is not None:
-                    model_path = models_root / f"fold-{fold.fold:02d}-{output.name}.txt"
-                    model_path.write_text(output.model_text, encoding="utf-8", newline="\n")
-                    model_files.append(model_path)
-            fold_reports.append({**fold.to_dict(), "models": model_reports})
+                    calibrated_calibration = calibrator.transform(
+                        output.calibration_probabilities
+                    )
+                    calibrated_test = calibrator.transform(output.probabilities)
+                    probability_variants = {
+                        "raw": output.probabilities,
+                        "calibrated": calibrated_test,
+                    }
+                    for variant, probabilities in probability_variants.items():
+                        model_name = f"{output.name}_{profile}_{variant}"
+                        expected = expected_net_returns_bps(
+                            data,
+                            test,
+                            probabilities,
+                            timeout_estimate,
+                            parameters,
+                        )
+                        prediction_batches.append(
+                            PredictionBatch(
+                                model_name=model_name,
+                                fold=fold.fold,
+                                row_indices=test,
+                                probabilities=probabilities,
+                                expected_net_bps=expected,
+                            )
+                        )
+                        model_metadata[model_name] = {
+                            "base_model": output.name,
+                            "feature_profile": profile,
+                            "probability_variant": variant,
+                        }
+                        if output.feature_importance is not None:
+                            importance_by_model[model_name].append(
+                                output.feature_importance
+                            )
+                            importance_names[model_name] = profile_feature_names[
+                                profile
+                            ]
+                    profile_model_reports[output.name] = {
+                        "calibrator": calibrator.to_dict(),
+                        "raw": {
+                            "calibration_window": classification_metrics(
+                                data.y[calibration],
+                                output.calibration_probabilities,
+                            ),
+                            "outer_test": classification_metrics(
+                                data.y[test], output.probabilities
+                            ),
+                        },
+                        "calibrated": {
+                            "calibration_window": classification_metrics(
+                                data.y[calibration], calibrated_calibration
+                            ),
+                            "outer_test": classification_metrics(
+                                data.y[test], calibrated_test
+                            ),
+                        },
+                    }
+                    if output.model_text is not None:
+                        model_path = (
+                            models_root
+                            / f"fold-{fold.fold:02d}-{output.name}-{profile}.txt"
+                        )
+                        model_path.write_text(
+                            output.model_text, encoding="utf-8", newline="\n"
+                        )
+                        model_files.append(model_path)
+                profile_reports[profile] = {
+                    "feature_count": len(columns),
+                    "models": profile_model_reports,
+                }
+            fold_reports.append(
+                {
+                    **fold.to_dict(),
+                    "nested_calibration": calibration_split.to_dict(),
+                    "feature_profiles": profile_reports,
+                }
+            )
 
         model_names = sorted({batch.model_name for batch in prediction_batches})
         aggregate_models: dict[str, object] = {}
@@ -401,16 +547,19 @@ def run_offline_evaluation(
                     else mean_importance / total_importance
                 )
                 ranked = np.argsort(-normalized)[:25]
+                names = importance_names[model_name]
                 importance_report = [
                     {
-                        "feature": data.feature_names[int(index)],
+                        "feature": names[int(index)],
                         "gain_fraction": float(normalized[int(index)]),
                     }
                     for index in ranked
                 ]
             aggregate_models[model_name] = {
+                "contract": model_metadata[model_name],
                 "classification": aggregate_metrics,
                 "conditional_entry_backtest": backtest_summary,
+                "selected_trade_diagnostics": trade_diagnostics(trades),
                 "top_feature_importance": importance_report,
             }
             trade_path = trades_root / f"{model_name}.parquet"
@@ -439,6 +588,7 @@ def run_offline_evaluation(
                 "input_fingerprint": dataset.input_fingerprint,
                 "output_fingerprint": dataset.output_fingerprint,
                 "symbols": list(dataset.symbols),
+                "eligible_symbols": list(data.symbols),
                 "feature_rows": dataset.feature_rows,
                 "label_rows": dataset.label_rows,
                 "verified_parquet_files": len(
@@ -447,7 +597,17 @@ def run_offline_evaluation(
             },
             "parameters": parameter_payload,
             "prepared_rows": data.rows,
-            "model_feature_count": len(data.feature_names),
+            "model_feature_counts": {
+                profile: len(names)
+                for profile, names in profile_feature_names.items()
+            },
+            "pre_registered_comparisons": {
+                "feature_profiles": list(FEATURE_PROFILES),
+                "probability_variants": ["raw", "calibrated"],
+                "horizon_minutes": parameters.horizon_minutes,
+                "primary_candidate_model": "lightgbm_full_calibrated",
+                "selection_rule": "maximum expected net bps per decision minute",
+            },
             "excluded_rows": {
                 "ambiguous": data.excluded_ambiguous_rows,
                 "unpriced": data.excluded_unpriced_rows,
@@ -468,6 +628,7 @@ def run_offline_evaluation(
                     history_gate_met and len(folds) >= 3
                 ),
                 "eligible_for_profitability_conclusion": False,
+                "symbol_quality": symbol_quality_gate,
                 "reason": (
                     (
                         "price-only history also lacks order book, spread, funding, and "

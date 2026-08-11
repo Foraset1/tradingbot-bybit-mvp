@@ -73,9 +73,14 @@ embargo_minutes = 60
 minimum_train_days = 30
 test_days = 14
 maximum_folds = 4
-acceptance_minimum_days = 90
+acceptance_minimum_days = 365
 minimum_train_rows = 1000
 minimum_test_rows = 250
+# A strictly older, purged window is reserved for probability calibration.
+calibration_days = 7
+minimum_calibration_rows = 250
+# Incomplete price-history symbols are excluded before any model is fitted.
+minimum_symbol_coverage_fraction = 0.95
 maker_fee_bps = 2.0
 taker_fee_bps = 5.5
 entry_adverse_selection_bps = 1.0

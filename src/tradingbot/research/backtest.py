@@ -228,6 +228,12 @@ def run_one_position_backtest(
                 -int(data.side_codes[rows[position + offset]]),
             ),
         )
+        eligible_expected = np.sort(group_expected[eligible_offsets])[::-1]
+        expected_margin_to_second = (
+            None
+            if len(eligible_expected) < 2
+            else float(eligible_expected[0] - eligible_expected[1])
+        )
         selected_position = position + best_offset
         row = int(rows[selected_position])
         exit_at_ns, fee_bps, slippage_bps, funding_bps, net_bps = _actual_costs(
@@ -260,6 +266,9 @@ def run_one_position_backtest(
                 "probability_timeout": float(probabilities[selected_position, 1]),
                 "probability_tp_first": float(probabilities[selected_position, 2]),
                 "expected_net_bps": float(expected[selected_position]),
+                "candidate_count": group_end - position,
+                "eligible_candidate_count": len(eligible_offsets),
+                "expected_margin_to_second_bps": expected_margin_to_second,
                 "gross_return_bps": float(data.outcome_return_bps[row]),
                 "fee_bps": fee_bps,
                 "slippage_bps": slippage_bps,

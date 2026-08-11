@@ -1,165 +1,210 @@
-# Offline evaluation и conditional-entry backtest
+# Offline evaluation V2 и conditional-entry backtest
 
-Этот этап проверяет, содержат ли причинные рыночные признаки полезный сигнал на горизонте
-60 минут. Он остаётся полностью read-only: Bybit API key не нужен, ордера не создаются,
+Этот этап проверяет, содержит ли price/microstructure dataset причинный сигнал на горизонте
+15, 30 или 60 минут. Контур полностью read-only: Bybit API key не нужен, ордера не создаются,
 токены OpenAI не расходуются.
 
-## Что запускается
+## Почему появился V2
 
-Одна команда выполняет воспроизводимый конвейер:
+Первый 90-дневный эксперимент V1 был отклонён:
 
-1. проверяет manifest, SHA-256 и Parquet-схемы research dataset;
-2. оставляет разрешённые 60-минутные labels и связывает их с features по `decision_id`;
-3. строит expanding walk-forward folds без перемешивания времени;
-4. удаляет из train labels, пересекающие границу test, и добавляет embargo 60 минут;
-5. сравнивает class-prior baseline, logistic regression и LightGBM;
-6. выбирает максимум одну пару/сторону на каждую минуту;
-7. симулирует максимум одну позицию с комиссиями, slippage, funding и 24-часовым
-   ограничением потерь;
-8. атомарно записывает модели, сделки, отчёт и проверяемый manifest.
+- LightGBM: 613 сделок, `-3.0471%`, profit factor `0.6285`;
+- logistic: 25 сделок, `-0.238%`;
+- predicted EV имел отрицательную связь с фактическим результатом;
+- модель переоценивала вероятность TP и недооценивала SL;
+- даже те же сделки без комиссий оставались немного отрицательными.
 
-Все параметры входят в fingerprint эксперимента. Повторный запуск с теми же данными,
-конфигурацией и версиями библиотек проверяет существующие файлы и возвращает
-`reused: true`.
+Этот результат является development evidence, а не финальным holdout. Нельзя повторно
+подбирать параметры по тем же 90 дням и объявлять улучшение.
 
-## Запуск
+## Контракт V2
 
-Локально:
+Один запуск:
 
-```bash
-tradingbot run-backtest \
-  --research-dataset data/research/research-v1-<fingerprint> \
-  --output-root data/evaluations
-```
+1. проверяет manifest, SHA-256 и Parquet-схемы;
+2. для price-history вычисляет coverage каждой пары по полной UTC minute-grid;
+3. до обучения исключает пары с coverage ниже `0.95` (BTC обязан пройти gate);
+4. строит expanding walk-forward folds без перемешивания времени;
+5. внутри каждого fold выделяет отдельные `fit → purge → calibration → purge → test` окна;
+6. обучает class-prior, logistic regression и LightGBM;
+7. сравнивает два заранее заданных feature profile: `full` и `no_calendar`;
+8. сохраняет raw и причинно calibrated вероятности;
+9. в каждую минуту выбирает максимум одну пару/сторону по expected net bps;
+10. соблюдает одну позицию, комиссии, slippage, funding и 24-часовой loss limit;
+11. записывает breakdown по fold/symbol/side/outcome/EV-bin/EV-decile;
+12. отдельно показывает expected-vs-actual gap и max-candidate selection bias;
+13. атомарно сохраняет модели, сделки, report и проверяемый manifest.
 
-На сервере из Docker volume:
+Калибратор перебирает фиксированную сетку temperature/prior shrinkage только на calibration
+окне. Test не используется ни для обучения модели, ни для выбора калибровки.
+
+## Pre-registered матрица
+
+Матрица для следующего исследования фиксируется до просмотра результатов:
+
+| Измерение | Значения |
+|---|---|
+| Horizon | 15, 30, 60 минут |
+| Features | `full`, `no_calendar` |
+| Probability | `raw`, `calibrated` |
+| Models | logistic, LightGBM (+ class-prior baseline) |
+| Primary candidate | `lightgbm_full_calibrated` |
+| Symbol coverage | минимум 95% |
+| История для review | минимум 365 завершённых UTC дней |
+
+Каждый horizon создаёт отдельный immutable `backtest-v2-*`. Все три результата должны быть
+сохранены; нельзя оставить только лучший.
+
+## 365-дневный dataset
+
+Зафиксированный диапазон: `2025-08-08` — `2026-08-07` включительно (365 UTC дней).
+Импорт повторно использует уже готовые 90 дней и скачивает только отсутствующие partitions.
+Перед запуском должно быть не менее 30 GiB свободного места:
 
 ```bash
 cd /opt/tradingbot
-
-REPORT_DIR=/home/foraset1/tradingbot-reports
-sudo install -d -m 0750 -o foraset1 -g foraset1 "$REPORT_DIR"
-umask 027
-
-RESEARCH_DATASET=$(
-  sudo docker compose run --rm --no-deps \
-    --entrypoint python collector \
-    -c "from pathlib import Path; paths=list(Path('/data/research').glob('research-v1-*')); assert paths, 'research dataset not found'; print(max(paths, key=lambda p: p.stat().st_mtime_ns))"
-)
-sudo docker compose run --rm --no-deps collector \
-  python -m tradingbot run-backtest \
-  --research-dataset "$RESEARCH_DATASET" \
-  --output-root /data/evaluations \
-  > "$REPORT_DIR/backtest-build-result.json"
-
-jq . "$REPORT_DIR/backtest-build-result.json"
-sudo chown foraset1:foraset1 "$REPORT_DIR/backtest-build-result.json"
+docker compose exec collector sh -c 'df -h /data; du -sh /data/history /data/research /data/evaluations 2>/dev/null || true'
 ```
 
-Для результата `build-price-research` путь лучше брать прямо из сохранённого JSON, не
-угадывая fingerprint:
+Импорт следует запускать в `tmux`, последовательно, не останавливая collector:
 
 ```bash
-PRICE_RESULT=/home/foraset1/tradingbot-reports/price-research-90d-2026-08-07.json
-RESEARCH_DATASET=$(jq -er '.dataset_path' "$PRICE_RESULT")
+tmux new -s bybit-history-365d
 
-sudo docker compose run --rm --no-deps collector \
-  python -m tradingbot run-backtest \
-  --research-dataset "$RESEARCH_DATASET" \
-  --output-root /data/evaluations \
-  > /home/foraset1/tradingbot-reports/backtest-price-90d-2026-08-07.json
+set +e
+cd /opt/tradingbot
+REPORT_DIR=/home/foraset1/tradingbot-reports
+install -d -m 0750 -o foraset1 -g foraset1 "$REPORT_DIR"
+REPORT="$REPORT_DIR/history-import-365d-2026-08-07.json"
+LOG="$REPORT_DIR/history-import-365d-2026-08-07.log"
+
+docker compose run --rm --no-deps collector \
+  python -m tradingbot import-history \
+  --from-date 2025-08-08 \
+  --to-date 2026-08-07 \
+  > "$REPORT" 2> "$LOG"
+
+STATUS=$?
+chown foraset1:foraset1 "$REPORT" "$LOG"
+echo "exit=$STATUS"
+jq . "$REPORT"
+grep -Ei 'warning|error|traceback' "$LOG" || true
+docker compose ps
 ```
 
-Для первого технического smoke-test можно использовать уже созданный snapshot. Для нового
-72-часового snapshot сначала нужно повторить strict audit, `build-dataset` и
-`build-research`; нельзя дописывать данные в уже созданный versioned dataset.
+Отсоединиться: `Ctrl-b`, затем `d`. Вернуться: `tmux attach -t bybit-history-365d`.
+
+После успешного импорта строится immutable research dataset:
+
+```bash
+set +e
+cd /opt/tradingbot
+REPORT_DIR=/home/foraset1/tradingbot-reports
+REPORT="$REPORT_DIR/price-research-365d-2026-08-07.json"
+LOG="$REPORT_DIR/price-research-365d-2026-08-07.log"
+
+docker compose run --rm --no-deps collector \
+  python -m tradingbot build-price-research \
+  --catalog /data/history/catalog.json \
+  --from-date 2025-08-08 \
+  --to-date 2026-08-07 \
+  --output-root /data/research \
+  > "$REPORT" 2> "$LOG"
+
+STATUS=$?
+chown foraset1:foraset1 "$REPORT" "$LOG"
+echo "exit=$STATUS"
+jq . "$REPORT"
+grep -Ei 'warning|error|traceback' "$LOG" || true
+```
+
+## Запуск трёх V2 экспериментов
+
+Запуски выполняются последовательно: два параллельных LightGBM процесса могут мешать
+collector и превысить 10 GiB RAM.
+
+```bash
+set +e
+cd /opt/tradingbot
+REPORT_DIR=/home/foraset1/tradingbot-reports
+PRICE_RESULT="$REPORT_DIR/price-research-365d-2026-08-07.json"
+RESEARCH_DATASET=$(jq -er '.dataset_path' "$PRICE_RESULT") || exit 1
+
+for HORIZON in 15 30 60; do
+  RESULT="$REPORT_DIR/backtest-v2-price-365d-h${HORIZON}-build.json"
+  LOG="$REPORT_DIR/backtest-v2-price-365d-h${HORIZON}.log"
+  TRADINGBOT_COLLECTOR_MEMORY=8g docker compose run --rm --no-deps collector \
+    python -m tradingbot run-backtest \
+    --research-dataset "$RESEARCH_DATASET" \
+    --output-root /data/evaluations \
+    --horizon-minutes "$HORIZON" \
+    > "$RESULT" 2> "$LOG"
+  STATUS=$?
+  chown foraset1:foraset1 "$RESULT" "$LOG"
+  echo "horizon=$HORIZON exit=$STATUS"
+  [ "$STATUS" -eq 0 ] || break
+  jq . "$RESULT"
+done
+```
+
+Эту команду также следует выполнять в отдельной `tmux`-сессии. Она может работать несколько
+часов. Collector должен оставаться `healthy`.
 
 ## Результаты
 
-Команда создаёт каталог вида:
-
 ```text
-/data/evaluations/backtest-v1-<input-fingerprint>/
+/data/evaluations/backtest-v2-<input-fingerprint>/
 ├── manifest.json
 ├── report.json
 ├── models/
-│   └── fold-01-lightgbm.txt
+│   ├── fold-01-lightgbm-full.txt
+│   └── fold-01-lightgbm-no_calendar.txt
 └── trades/
     ├── class_prior.parquet
-    ├── lightgbm.parquet
-    └── logistic.parquet
+    ├── lightgbm_full_raw.parquet
+    ├── lightgbm_full_calibrated.parquet
+    ├── lightgbm_no_calendar_raw.parquet
+    └── ...
 ```
 
 `report.json` содержит:
 
-- границы train/test каждого fold;
-- log loss, multiclass Brier score, accuracy и calibration error;
-- cost-aware результат каждой модели, drawdown, profit factor и причины пропуска входов;
-- число исключённых `AMBIGUOUS` и непросчитанных labels;
-- версии Python, NumPy, PyArrow, scikit-learn и LightGBM;
-- data gate и явные ограничения симуляции.
+- eligibility/exclusion и coverage каждой пары;
+- границы fit/calibration/test и доказательство purge;
+- raw/calibrated log loss, Brier, ECE и частоты классов;
+- cost-aware backtest и zero-cost same-trades comparison;
+- breakdown по fold, symbol, side, outcome, EV bins и deciles;
+- predicted-vs-observed вероятности на выбранных сделках;
+- Pearson/Spearman expected-vs-actual;
+- число конкурирующих кандидатов и преимущество победителя над вторым;
+- ограничения price-only и `eligible_for_profitability_conclusion: false`.
 
-Чтобы скопировать небольшие JSON-файлы на host после выполнения команды:
+Для копирования малых JSON каждого horizon:
 
 ```bash
 REPORT_DIR=/home/foraset1/tradingbot-reports
-RESULT_PATH=$(jq -r '.experiment_path' "$REPORT_DIR/backtest-build-result.json")
-sudo docker compose run --rm --no-deps collector \
-  sh -c "cat '$RESULT_PATH/report.json'" \
-  > "$REPORT_DIR/backtest-report.json"
-sudo docker compose run --rm --no-deps collector \
-  sh -c "cat '$RESULT_PATH/manifest.json'" \
-  > "$REPORT_DIR/backtest-manifest.json"
-sudo chown foraset1:foraset1 \
-  "$REPORT_DIR/backtest-report.json" \
-  "$REPORT_DIR/backtest-manifest.json"
+for HORIZON in 15 30 60; do
+  BUILD="$REPORT_DIR/backtest-v2-price-365d-h${HORIZON}-build.json"
+  RESULT_PATH=$(jq -er '.experiment_path' "$BUILD") || exit 1
+  docker compose run --rm --no-deps collector \
+    sh -c "cat '$RESULT_PATH/report.json'" \
+    > "$REPORT_DIR/backtest-v2-price-365d-h${HORIZON}-report.json"
+  docker compose run --rm --no-deps collector \
+    sh -c "cat '$RESULT_PATH/manifest.json'" \
+    > "$REPORT_DIR/backtest-v2-price-365d-h${HORIZON}-manifest.json"
+done
+chown foraset1:foraset1 "$REPORT_DIR"/backtest-v2-price-365d-*.json
 ```
 
-## Как трактовать короткую историю
+## Ограничения интерпретации
 
-При истории короче 44 дней (30 дней train + 14 дней test) создаётся один явный
-`technical_smoke` split 70/30. Он проверяет только работоспособность конвейера, отсутствие
-утечки между train/test и формат результатов.
+Даже положительный V2 не доказывает реальную доходность:
 
-Для содержательного первого обзора модели конфигурация требует минимум 90 дней и не менее
-трёх walk-forward folds. Даже после этого `eligible_for_profitability_conclusion` остаётся
-`false`, пока отдельный simulator не смоделирует вероятность maker fill, положение в очереди
-и partial fills.
+- price-only profile не содержит стакан, spread, funding history и open interest;
+- conditional entry предполагает исполнение maker-ордера;
+- `NO_FILL`, queue position и partial fills не моделируются;
+- выбор лучшего кандидата создаёт зависимые наблюдения;
+- после этой development-матрицы нужен новый untouched future/shadow holdout;
+- затем нужны maker execution simulator и Demo/Shadow Mode.
 
-Иными словами:
-
-- 72 часа — запускать сейчас для проверки техники;
-- 44+ дня — появляются обычные walk-forward окна;
-- 90+ дней — можно впервые сравнивать устойчивость рыночного сигнала;
-- вывод о реальной доходности — только после execution simulator и paper/testnet.
-
-## Зафиксированные допущения
-
-Значения по умолчанию находятся в `[evaluation]` файла `config/tradingbot.toml`:
-
-- maker fee: 2 bps на вход и maker TP;
-- taker fee: 5,5 bps для stop/timeout;
-- adverse selection входа: 1 bp;
-- дополнительное stop slippage: 3 bps;
-- дополнительное timeout slippage: 1 bp;
-- вход разрешён при ожидаемом net return не ниже 1 bp;
-- LightGBM использует 4 потока, оставляя ресурсы collector на VM с 6 vCPU.
-
-Перед финансовой интерпретацией комиссии нужно заменить на фактический тариф аккаунта.
-Текущий backtest условно предполагает, что выбранный maker-вход исполнился. Он не выдаёт
-`NO_FILL`, не оценивает queue position и не заявляет реальную maker fill rate.
-
-Для `price_futures_research_v1` дополнительно отсутствует история funding: соответствующие
-значения остаются неизвестными (`NaN`) и не включаются в модель, а funding cost в таком
-предварительном backtest равен нулю. Поэтому даже 90-дневный положительный результат этого
-профиля нельзя трактовать как оценку чистой реальной доходности.
-
-## Что прислать для проверки
-
-Достаточно трёх небольших файлов:
-
-- `/home/foraset1/tradingbot-reports/backtest-build-result.json`;
-- `/home/foraset1/tradingbot-reports/backtest-report.json`;
-- `/home/foraset1/tradingbot-reports/backtest-manifest.json`.
-
-Parquet со сделками и файлы моделей передавать не нужно, пока JSON-аудит не выявит проблему.
+Новый private API или live trading этим этапом не включается.

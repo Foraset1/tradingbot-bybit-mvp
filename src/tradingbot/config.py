@@ -86,6 +86,9 @@ class EvaluationConfig:
     acceptance_minimum_days: int
     minimum_train_rows: int
     minimum_test_rows: int
+    calibration_days: int
+    minimum_calibration_rows: int
+    minimum_symbol_coverage_fraction: float
     maker_fee_bps: float
     taker_fee_bps: float
     entry_adverse_selection_bps: float
@@ -253,6 +256,8 @@ def _validate_evaluation(config: EvaluationConfig, risk: RiskConfig) -> None:
         "acceptance_minimum_days": config.acceptance_minimum_days,
         "minimum_train_rows": config.minimum_train_rows,
         "minimum_test_rows": config.minimum_test_rows,
+        "calibration_days": config.calibration_days,
+        "minimum_calibration_rows": config.minimum_calibration_rows,
         "lightgbm_estimators": config.lightgbm_estimators,
         "lightgbm_num_leaves": config.lightgbm_num_leaves,
         "lightgbm_min_child_samples": config.lightgbm_min_child_samples,
@@ -265,6 +270,14 @@ def _validate_evaluation(config: EvaluationConfig, risk: RiskConfig) -> None:
     ):
         raise ConfigError(
             "evaluation.acceptance_minimum_days must cover train and test windows"
+        )
+    if config.calibration_days >= config.minimum_train_days:
+        raise ConfigError(
+            "evaluation.calibration_days must be shorter than minimum_train_days"
+        )
+    if not 0 < config.minimum_symbol_coverage_fraction <= 1:
+        raise ConfigError(
+            "evaluation.minimum_symbol_coverage_fraction must be within (0, 1]"
         )
     costs = {
         "maker_fee_bps": config.maker_fee_bps,
@@ -517,6 +530,22 @@ def load_config(path: str | Path) -> AppConfig:
         minimum_test_rows=_integer(
             _required(evaluation_raw, "minimum_test_rows", "evaluation"),
             "evaluation.minimum_test_rows",
+        ),
+        calibration_days=_integer(
+            _required(evaluation_raw, "calibration_days", "evaluation"),
+            "evaluation.calibration_days",
+        ),
+        minimum_calibration_rows=_integer(
+            _required(evaluation_raw, "minimum_calibration_rows", "evaluation"),
+            "evaluation.minimum_calibration_rows",
+        ),
+        minimum_symbol_coverage_fraction=_number(
+            _required(
+                evaluation_raw,
+                "minimum_symbol_coverage_fraction",
+                "evaluation",
+            ),
+            "evaluation.minimum_symbol_coverage_fraction",
         ),
         maker_fee_bps=_number(
             _required(evaluation_raw, "maker_fee_bps", "evaluation"),
