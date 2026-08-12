@@ -22,7 +22,9 @@ from tradingbot.research.contracts import (
     RESEARCH_SCHEMA_VERSION,
 )
 from tradingbot.research.evaluation_contracts import (
+    CALENDAR_FEATURE_NAMES,
     DIRECT_FEATURE_COLUMNS,
+    FEATURE_PROFILES,
     LOG1P_FEATURE_COLUMNS,
     OUTCOME_NAMES,
     PRICE_DIRECT_FEATURE_COLUMNS,
@@ -31,6 +33,8 @@ from tradingbot.research.evaluation_contracts import (
     PreparedData,
     ResearchDataset,
 )
+
+SECONDS_PER_DAY = 24 * 60 * 60
 
 
 def _sha256_file(path: Path) -> str:
@@ -275,6 +279,147 @@ def _read_tables(paths: tuple[Path, ...], columns: list[str]) -> pa.Table:
     return pa.concat_tables(tables)
 
 
+def _partition_symbol(path: Path) -> str | None:
+    for part in path.parts:
+        if part.startswith("symbol="):
+            return part.removeprefix("symbol=")
+    return None
+
+
+def _read_filtered_labels(
+    paths: tuple[Path, ...],
+    columns: list[str],
+    *,
+    horizon_minutes: int,
+    allowed_symbols: tuple[str, ...],
+) -> pa.Table:
+    allowed_values = pa.array(allowed_symbols, type=pa.string())
+    tables: list[pa.Table] = []
+    for path in paths:
+        if _partition_symbol(path) not in allowed_symbols:
+            continue
+        table = pq.ParquetFile(path).read(columns=columns)
+        table = table.filter(
+            pc.and_(
+                pc.equal(
+                    table.column("horizon_minutes"), pa.scalar(horizon_minutes)
+                ),
+                pc.is_in(table.column("symbol"), value_set=allowed_values),
+            )
+        )
+        if table.num_rows:
+            tables.append(table)
+    if not tables:
+        raise EvaluationError(f"research dataset has no {horizon_minutes}m labels")
+    return pa.concat_tables(tables)
+
+
+def build_symbol_quality_gate(
+    dataset: ResearchDataset, *, minimum_coverage_fraction: float
+) -> tuple[tuple[str, ...], dict[str, object]]:
+    """Select symbols using only verified manifest row coverage.
+
+    Price-history research has a complete UTC decision-grid contract, so missing
+    feature minutes can be measured before any model is fitted. Microstructure
+    datasets predate that contract and are reported but not silently filtered.
+    """
+
+    if not 0 < minimum_coverage_fraction <= 1:
+        raise EvaluationError("minimum symbol coverage must be within (0, 1]")
+    feature_rows: Counter[str] = Counter()
+    for raw in cast(list[object], dataset.manifest["files"]):
+        item = _object(raw, "files[]")
+        if item.get("table") == "features":
+            feature_rows[_string(item.get("symbol"), "files[].symbol")] += (
+                _nonnegative_int(item.get("rows"), "files[].rows")
+            )
+
+    if dataset.research_profile != PRICE_RESEARCH_PROFILE:
+        unfiltered_symbols_report: dict[str, object] = {
+            symbol: {
+                "feature_rows": feature_rows[symbol],
+                "expected_feature_rows": None,
+                "coverage_fraction": None,
+                "eligible": True,
+                "reason": "decision-grid coverage contract unavailable",
+            }
+            for symbol in dataset.symbols
+        }
+        return dataset.symbols, {
+            "enforced": False,
+            "minimum_coverage_fraction": minimum_coverage_fraction,
+            "eligible_symbols": list(dataset.symbols),
+            "excluded_symbols": [],
+            "symbols": unfiltered_symbols_report,
+            "reason": "microstructure research predates the price-grid coverage gate",
+        }
+
+    source = _object(dataset.manifest.get("source"), "source")
+    parameters = _object(dataset.manifest.get("parameters"), "parameters")
+    days = _nonnegative_int(source.get("days"), "source.days")
+    interval_seconds = _nonnegative_int(
+        parameters.get("decision_interval_seconds"),
+        "parameters.decision_interval_seconds",
+    )
+    if days <= 0 or interval_seconds <= 0 or SECONDS_PER_DAY % interval_seconds:
+        raise EvaluationError("price research has an invalid decision-grid contract")
+    expected_rows = days * (SECONDS_PER_DAY // interval_seconds)
+    eligible: list[str] = []
+    symbols_report: dict[str, object] = {}
+    for symbol in dataset.symbols:
+        actual = feature_rows[symbol]
+        coverage = actual / expected_rows
+        accepted = coverage >= minimum_coverage_fraction
+        if accepted:
+            eligible.append(symbol)
+        symbols_report[symbol] = {
+            "feature_rows": actual,
+            "expected_feature_rows": expected_rows,
+            "coverage_fraction": coverage,
+            "eligible": accepted,
+            "reason": (
+                "coverage threshold met"
+                if accepted
+                else "feature coverage below the pre-registered threshold"
+            ),
+        }
+    if "BTCUSDT" not in eligible:
+        raise EvaluationError("BTCUSDT failed the symbol coverage gate")
+    if len(eligible) < 2:
+        raise EvaluationError("fewer than two symbols passed the coverage gate")
+    excluded = [symbol for symbol in dataset.symbols if symbol not in eligible]
+    return tuple(eligible), {
+        "enforced": True,
+        "minimum_coverage_fraction": minimum_coverage_fraction,
+        "expected_feature_rows_per_symbol": expected_rows,
+        "eligible_symbols": eligible,
+        "excluded_symbols": excluded,
+        "symbols": symbols_report,
+        "reason": "verified feature rows divided by the complete UTC decision grid",
+    }
+
+
+def feature_profile_indices(
+    feature_names: tuple[str, ...], profile: str
+) -> NDArray[np.int64]:
+    if profile not in FEATURE_PROFILES:
+        raise EvaluationError(f"unsupported feature profile: {profile}")
+    if profile == "full":
+        return np.arange(len(feature_names), dtype=np.int64)
+    selected = np.fromiter(
+        (
+            index
+            for index, name in enumerate(feature_names)
+            if name not in CALENDAR_FEATURE_NAMES
+        ),
+        dtype=np.int64,
+    )
+    removed = set(feature_names).intersection(CALENDAR_FEATURE_NAMES)
+    if removed != set(CALENDAR_FEATURE_NAMES):
+        raise EvaluationError("calendar ablation requires all four calendar features")
+    return selected
+
+
 def _count_true(values: pa.Array | pa.ChunkedArray) -> int:
     result = pc.sum(pc.cast(values, pa.int64())).as_py()
     return 0 if result is None else int(result)
@@ -297,12 +442,25 @@ def _int_array(
 
 
 def prepare_evaluation_data(
-    dataset: ResearchDataset, *, horizon_minutes: int
+    dataset: ResearchDataset,
+    *,
+    horizon_minutes: int,
+    allowed_symbols: tuple[str, ...] | None = None,
 ) -> PreparedData:
     """Join one market horizon to causal features and create a bounded float32 matrix."""
 
     if horizon_minutes not in {5, 15, 30, 60}:
         raise EvaluationError("horizon_minutes must be one of 5, 15, 30, or 60")
+    selected_symbols = dataset.symbols if allowed_symbols is None else allowed_symbols
+    if (
+        not selected_symbols
+        or len(set(selected_symbols)) != len(selected_symbols)
+        or any(symbol not in dataset.symbols for symbol in selected_symbols)
+    ):
+        raise EvaluationError("allowed_symbols must be a unique subset of the dataset")
+    selected_symbols = tuple(
+        symbol for symbol in dataset.symbols if symbol in set(selected_symbols)
+    )
     direct_feature_columns: tuple[str, ...]
     log1p_feature_columns: tuple[str, ...]
     if dataset.research_profile == PRICE_RESEARCH_PROFILE:
@@ -333,14 +491,23 @@ def prepare_evaluation_data(
         "hit_at_ns",
         "outcome_return_bps",
     ]
-    features = _read_tables(dataset.feature_paths, feature_columns)
-    labels = _read_tables(dataset.label_paths, label_columns)
-    labels = labels.filter(
-        pc.equal(labels.column("horizon_minutes"), pa.scalar(horizon_minutes))
+    selected_feature_paths = tuple(
+        path
+        for path in dataset.feature_paths
+        if _partition_symbol(path) in selected_symbols
     )
-    if labels.num_rows == 0:
-        raise EvaluationError(f"research dataset has no {horizon_minutes}m labels")
-
+    features = _read_tables(selected_feature_paths, feature_columns)
+    labels = _read_filtered_labels(
+        dataset.label_paths,
+        label_columns,
+        horizon_minutes=horizon_minutes,
+        allowed_symbols=selected_symbols,
+    )
+    allowed_values = pa.array(selected_symbols, type=pa.string())
+    features = features.filter(
+        pc.is_in(features.column("symbol"), value_set=allowed_values)
+    )
+    labels = labels.filter(pc.is_in(labels.column("symbol"), value_set=allowed_values))
     ambiguous = pc.equal(labels.column("outcome"), pa.scalar("AMBIGUOUS"))
     excluded_ambiguous = _count_true(ambiguous)
     recognized = pc.is_in(
@@ -395,7 +562,7 @@ def prepare_evaluation_data(
     symbols_raw = np.asarray(
         joined.column("symbol").combine_chunks().to_pylist(), dtype=np.str_
     )
-    symbol_lookup = {symbol: index for index, symbol in enumerate(dataset.symbols)}
+    symbol_lookup = {symbol: index for index, symbol in enumerate(selected_symbols)}
     try:
         symbol_codes = np.fromiter(
             (symbol_lookup[value] for value in symbols_raw),
@@ -427,7 +594,7 @@ def prepare_evaluation_data(
         "stop_distance_bps",
         "take_profit_distance_bps",
         "side_direction",
-        *(f"symbol_{symbol}" for symbol in dataset.symbols),
+        *(f"symbol_{symbol}" for symbol in selected_symbols),
     )
     x = np.empty((rows, len(feature_names)), dtype=np.float32)
     column_index = 0
@@ -458,7 +625,7 @@ def prepare_evaluation_data(
     column_index += 1
     x[:, column_index] = side_codes.astype(np.float32)
     column_index += 1
-    for symbol_code in range(len(dataset.symbols)):
+    for symbol_code in range(len(selected_symbols)):
         x[:, column_index] = (symbol_codes == symbol_code).astype(np.float32)
         column_index += 1
     if column_index != x.shape[1]:
@@ -491,7 +658,7 @@ def prepare_evaluation_data(
         label_end_ns=label_end_ns,
         hit_at_ns=_int_array(joined, "hit_at_ns", null_value=-1),
         symbol_codes=symbol_codes,
-        symbols=dataset.symbols,
+        symbols=selected_symbols,
         side_codes=side_codes,
         outcome_return_bps=gross_returns,
         stop_distance_bps=stop_distance,

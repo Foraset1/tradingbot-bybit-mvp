@@ -232,15 +232,18 @@ tradingbot build-research \
 ```bash
 tradingbot run-backtest \
   --research-dataset data/research/research-v1-<input-fingerprint> \
-  --output-root data/evaluations
+  --output-root data/evaluations \
+  --horizon-minutes 60
 ```
 
 ## Границы текущей версии
 
 В проекте пока намеренно нет приватного API Bybit, ключей, плеча, исполнения ордеров,
 торговой стратегии или обещания доходности. Baseline, LightGBM и purged walk-forward backtest
-уже реализованы. История короче 44 дней запускает только технический 70/30 smoke-test;
-первый осмысленный обзор модели разрешён после 90 дней и минимум трёх временных folds.
+уже реализованы. Evaluation V2 добавляет отдельное purged calibration-окно, coverage gate
+по символам, ablation календарных признаков и diagnostics selection bias. История короче
+44 дней запускает только технический 70/30 smoke-test; следующий зафиксированный model review
+требует 365 завершённых UTC дней и минимум трёх временных folds.
 Даже тогда нельзя делать вывод о реальной доходности до отдельного maker execution simulator.
 Текущих секундных L50 snapshots и public trades достаточно для первой модели движения на
 5–60 минут, но недостаточно для точного положения maker-ордера в очереди. `NO_FILL` и

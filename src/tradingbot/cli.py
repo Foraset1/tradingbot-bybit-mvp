@@ -7,6 +7,7 @@ import logging
 import os
 import signal
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -158,6 +159,13 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Evaluation parent directory (defaults to evaluations beside storage.root)",
+    )
+    evaluation.add_argument(
+        "--horizon-minutes",
+        type=int,
+        choices=(15, 30, 60),
+        default=None,
+        help="Pre-registered barrier horizon override (15, 30, or 60 minutes)",
     )
     archive = subparsers.add_parser(
         "archive-day",
@@ -444,6 +452,13 @@ def _config_summary(config: AppConfig) -> dict[str, object]:
             "minimum_train_days": config.evaluation.minimum_train_days,
             "test_days": config.evaluation.test_days,
             "acceptance_minimum_days": config.evaluation.acceptance_minimum_days,
+            "calibration_days": config.evaluation.calibration_days,
+            "minimum_calibration_rows": (
+                config.evaluation.minimum_calibration_rows
+            ),
+            "minimum_symbol_coverage_fraction": (
+                config.evaluation.minimum_symbol_coverage_fraction
+            ),
             "training_threads": config.evaluation.training_threads,
         },
         "mode": "public-read-only",
@@ -579,6 +594,7 @@ def _run_backtest(
     config: AppConfig,
     research_dataset: Path,
     output_root: Path | None,
+    horizon_minutes: int | None,
 ) -> None:
     try:
         from tradingbot.research.evaluation_contracts import EvaluationError
@@ -594,6 +610,14 @@ def _run_backtest(
             raise SystemExit(1) from exc
         raise
 
+    if horizon_minutes is not None:
+        config = replace(
+            config,
+            evaluation=replace(
+                config.evaluation,
+                horizon_minutes=horizon_minutes,
+            ),
+        )
     destination = (
         config.storage.root.parent / "evaluations"
         if output_root is None
@@ -821,7 +845,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         return
     if args.command == "run-backtest":
-        _run_backtest(config, args.research_dataset, args.output_root)
+        _run_backtest(
+            config,
+            args.research_dataset,
+            args.output_root,
+            args.horizon_minutes,
+        )
         return
     if args.command == "archive-day":
         _run_archive_day(

@@ -317,6 +317,7 @@ sudo docker compose run --rm --no-deps collector \
   python -m tradingbot run-backtest \
   --research-dataset "$RESEARCH_DATASET" \
   --output-root /data/evaluations \
+  --horizon-minutes 60 \
   > "$REPORT_DIR/backtest-build-result.json"
 
 RESULT_PATH=$(jq -r '.experiment_path' "$REPORT_DIR/backtest-build-result.json")
@@ -331,7 +332,7 @@ sudo chown foraset1:foraset1 "$REPORT_DIR"/*.json
 
 На текущих 72 часах ожидается `data_mode: technical_smoke`: это проверка всего конвейера,
 а не качества или доходности модели. Обычные временные окна требуют минимум 44 дней;
-первый model review — минимум 90 дней и три folds. Подробный контракт находится в
+зафиксированный V2 model review — минимум 365 дней и три folds. Подробный контракт находится в
 [`RESEARCH_BACKTEST.md`](RESEARCH_BACKTEST.md).
 
 ## 10. Остановка, обновление и важное предупреждение

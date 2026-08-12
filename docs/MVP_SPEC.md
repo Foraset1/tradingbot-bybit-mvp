@@ -182,7 +182,7 @@ Accuracy не является основной метрикой. Нужны к�
 | 1. Collector | качественные публичные данные и health monitoring — готов | нет |
 | 2a. Canonical dataset | audited JSONL → typed versioned Parquet — реализовано | нет |
 | 2b. Features и labels | causal features, decision grid, market labels — реализовано | нет |
-| 3. Research | baseline, LightGBM, purged walk-forward и conditional-entry backtest — реализовано; ждём 90 дней данных | нет |
+| 3. Research | V1 отклонён; V2 с nested calibration, coverage gate и ablation реализован; расширяем immutable history до 365 дней | нет |
 | 4. Simulator | maker queue/partial fills/slippage/funding | нет |
 | 5. Testnet/paper | state machine, reconciliation, alerts, kill switch | testnet |
 | 6. Tiny live | минимальный номинал и ручное наблюдение | ограниченные |
@@ -223,8 +223,9 @@ Raw-события не переписываются: при нескольки�
 [`RESEARCH_BACKTEST.md`](RESEARCH_BACKTEST.md).
 
 Research evaluation считается технически готовой, когда один и тот же immutable dataset
-даёт воспроизводимый experiment ID, temporal folds не пересекаются, train labels полностью
-заканчиваются до embargo и проходят class-prior/logistic/LightGBM. История короче 44 дней
-маркируется только как `technical_smoke`. Для первого обзора рыночной модели нужны минимум
-90 дней и три walk-forward folds. Этот gate не разрешает live: maker execution simulator,
-paper/testnet и защиты private API остаются отдельными последующими этапами.
+даёт воспроизводимый experiment ID, temporal folds не пересекаются, а fit/calibration/test
+разделены purge и embargo. V2 сравнивает raw/calibrated probabilities и `full`/`no_calendar`
+до просмотра результата. История короче 44 дней маркируется только как `technical_smoke`.
+Следующий зафиксированный обзор требует 365 дней и три walk-forward folds. Этот gate не
+разрешает live: untouched future/shadow holdout, maker execution simulator, paper/testnet и
+защиты private API остаются отдельными последующими этапами.

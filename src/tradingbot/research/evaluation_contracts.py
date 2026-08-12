@@ -7,12 +7,22 @@ from typing import Any, Final
 import numpy as np
 from numpy.typing import NDArray
 
-EVALUATION_SCHEMA_VERSION: Final = 1
+EVALUATION_SCHEMA_VERSION: Final = 2
 NS_PER_MINUTE: Final = 60 * 1_000_000_000
 NS_PER_DAY: Final = 24 * 60 * NS_PER_MINUTE
 
 OUTCOME_NAMES: Final = ("SL_FIRST", "TIMEOUT", "TP_FIRST")
 OUTCOME_TO_INDEX: Final = {name: index for index, name in enumerate(OUTCOME_NAMES)}
+
+FEATURE_PROFILES: Final = ("full", "no_calendar")
+CALENDAR_FEATURE_NAMES: Final = frozenset(
+    {
+        "utc_hour_sin",
+        "utc_hour_cos",
+        "utc_weekday_sin",
+        "utc_weekday_cos",
+    }
+)
 
 DIRECT_FEATURE_COLUMNS: Final = (
     "book_age_ms",
@@ -165,6 +175,9 @@ class EvaluationParameters:
     acceptance_minimum_days: int
     minimum_train_rows: int
     minimum_test_rows: int
+    calibration_days: int
+    minimum_calibration_rows: int
+    minimum_symbol_coverage_fraction: float
     maker_fee_bps: float
     taker_fee_bps: float
     entry_adverse_selection_bps: float
@@ -191,6 +204,11 @@ class EvaluationParameters:
             "acceptance_minimum_days": self.acceptance_minimum_days,
             "minimum_train_rows": self.minimum_train_rows,
             "minimum_test_rows": self.minimum_test_rows,
+            "calibration_days": self.calibration_days,
+            "minimum_calibration_rows": self.minimum_calibration_rows,
+            "minimum_symbol_coverage_fraction": (
+                self.minimum_symbol_coverage_fraction
+            ),
             "maker_fee_bps": self.maker_fee_bps,
             "taker_fee_bps": self.taker_fee_bps,
             "entry_adverse_selection_bps": self.entry_adverse_selection_bps,
@@ -271,6 +289,24 @@ class TemporalFold:
             "train_end_ns": self.train_end_ns,
             "test_start_ns": self.test_start_ns,
             "test_end_ns": self.test_end_ns,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationSplit:
+    fit_indices: NDArray[np.int64]
+    calibration_indices: NDArray[np.int64]
+    calibration_start_ns: int
+    calibration_end_ns: int
+    fit_purge_cutoff_ns: int
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "fit_rows": len(self.fit_indices),
+            "calibration_rows": len(self.calibration_indices),
+            "calibration_start_ns": self.calibration_start_ns,
+            "calibration_end_ns": self.calibration_end_ns,
+            "fit_purge_cutoff_ns": self.fit_purge_cutoff_ns,
         }
 
 

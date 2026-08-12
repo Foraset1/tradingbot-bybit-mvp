@@ -34,7 +34,10 @@ def test_loads_expected_safe_defaults(config_path: Path) -> None:
     assert config.history.maximum_missing_minutes == 5
     assert config.evaluation.horizon_minutes == 60
     assert config.evaluation.embargo_minutes == 60
-    assert config.evaluation.acceptance_minimum_days == 90
+    assert config.evaluation.acceptance_minimum_days == 365
+    assert config.evaluation.calibration_days == 7
+    assert config.evaluation.minimum_calibration_rows == 250
+    assert config.evaluation.minimum_symbol_coverage_fraction == 0.95
     assert config.evaluation.training_threads == 4
 
 
@@ -186,6 +189,16 @@ def test_accepts_risk_values_below_mvp_caps(config_path: Path, tmp_path: Path) -
             "training_threads = 4",
             "training_threads = 0",
             "integer limits must be positive",
+        ),
+        (
+            "calibration_days = 7",
+            "calibration_days = 30",
+            "must be shorter",
+        ),
+        (
+            "minimum_symbol_coverage_fraction = 0.95",
+            "minimum_symbol_coverage_fraction = 1.1",
+            r"within \(0, 1\]",
         ),
         (
             "raw_retention_days = 7",
