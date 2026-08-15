@@ -91,6 +91,9 @@ lightgbm_estimators = 300
 lightgbm_learning_rate = 0.03
 lightgbm_num_leaves = 31
 lightgbm_min_child_samples = 100
-# Leave two vCPUs free for the collector on the current 6-vCPU VM.
-training_threads = 4
+# Logistic regression remains a baseline, but its deterministic, time-uniform fit
+# sample is bounded so a 365-day evaluation fits on the 8-GiB research server.
+logistic_max_training_rows = 500000
+# Leave two CPUs free for the collector and the host on the current 4-CPU server.
+training_threads = 2
 random_seed = 20260730

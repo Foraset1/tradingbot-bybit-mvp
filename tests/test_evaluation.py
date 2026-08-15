@@ -37,10 +37,12 @@ from tradingbot.research.evaluation_dataset import (
     validate_research_dataset,
 )
 from tradingbot.research.evaluator import (
+    _matrix_view,
     evaluation_parameters,
     run_offline_evaluation,
 )
 from tradingbot.research.models import (
+    _time_uniform_training_sample,
     classification_metrics,
     fit_probability_calibrator,
 )
@@ -280,6 +282,8 @@ def test_validates_and_prepares_causal_evaluation_rows(tmp_path: Path) -> None:
     assert prepared.rows == 720 * 2 * 2
     assert prepared.x.shape[1] == len(prepared.feature_names)
     assert prepared.x.shape[1] > 80
+    assert prepared.decision_ids.dtype.kind == "S"
+    assert bytes(prepared.decision_ids[0]).decode("ascii")
     assert set(prepared.y) == {0, 1, 2}
     assert prepared.excluded_ambiguous_rows == 0
     assert prepared.excluded_unpriced_rows == 0
@@ -310,6 +314,9 @@ def test_temporal_smoke_split_purges_future_labels(
     )
     assert not set(folds[0].train_indices).intersection(folds[0].test_indices)
     nested = build_calibration_split(prepared, folds[0], parameters)
+    full_columns = np.arange(prepared.x.shape[1], dtype=np.int64)
+    fit_matrix = _matrix_view(prepared, nested.fit_indices, full_columns)
+    assert np.shares_memory(fit_matrix, prepared.x)
     assert max(prepared.label_end_ns[nested.fit_indices]) <= (
         nested.calibration_start_ns - parameters.embargo_minutes * NS_PER_MINUTE
     )
@@ -317,6 +324,20 @@ def test_temporal_smoke_split_purges_future_labels(
         folds[0].test_start_ns - parameters.embargo_minutes * NS_PER_MINUTE
     )
     assert not set(nested.fit_indices).intersection(nested.calibration_indices)
+
+
+def test_logistic_fit_sample_is_deterministic_and_spans_time() -> None:
+    x = np.arange(3_000, dtype=np.float32).reshape(1_000, 3)
+    y = np.arange(1_000, dtype=np.int64) % len(OUTCOME_NAMES)
+
+    first_x, first_y = _time_uniform_training_sample(x, y, maximum_rows=100)
+    second_x, second_y = _time_uniform_training_sample(x, y, maximum_rows=100)
+
+    assert len(first_y) == 100
+    assert np.array_equal(first_x, second_x)
+    assert np.array_equal(first_y, second_y)
+    assert np.array_equal(first_x[0], x[0])
+    assert np.array_equal(first_x[-1], x[-1])
 
 
 def test_probability_calibrator_is_deterministic_and_never_worsens_fit_loss() -> None:
@@ -426,6 +447,7 @@ def test_offline_evaluation_is_idempotent_and_explicitly_smoke_only(
             config.evaluation,
             lightgbm_estimators=25,
             lightgbm_min_child_samples=10,
+            logistic_max_training_rows=1_000,
             training_threads=1,
         ),
     )
@@ -458,6 +480,13 @@ def test_offline_evaluation_is_idempotent_and_explicitly_smoke_only(
     }
     assert set(report["folds"][0]["feature_profiles"]) == {"full", "no_calendar"}
     assert report["folds"][0]["nested_calibration"]["calibration_rows"] > 0
+    logistic_report = report["folds"][0]["feature_profiles"]["full"]["models"][
+        "logistic"
+    ]
+    assert logistic_report["training_rows_used"] <= 1_000
+    assert logistic_report["training_rows_available"] >= (
+        logistic_report["training_rows_used"]
+    )
     assert report["pre_registered_comparisons"]["primary_candidate_model"] == (
         "lightgbm_full_calibrated"
     )

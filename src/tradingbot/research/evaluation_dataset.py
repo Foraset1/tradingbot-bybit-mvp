@@ -651,8 +651,14 @@ def prepare_evaluation_data(
         x=x,
         y=y,
         feature_names=tuple(feature_names),
+        # Decision IDs are hexadecimal ASCII. Fixed-width bytes use one byte per
+        # character instead of NumPy Unicode's four bytes, saving roughly 800 MiB
+        # on the 365-day price dataset without changing their persisted value.
         decision_ids=np.asarray(
-            joined.column("decision_id").combine_chunks().to_pylist(), dtype=np.str_
+            pc.cast(
+                joined.column("decision_id").combine_chunks(), pa.binary()
+            ).to_pylist(),
+            dtype=np.bytes_,
         ),
         decision_at_ns=decision_at_ns,
         label_end_ns=label_end_ns,

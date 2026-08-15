@@ -17,6 +17,12 @@ from tradingbot.research.evaluation_contracts import (
 )
 
 
+def _decision_id_text(value: np.bytes_) -> str:
+    """Decode the compact in-memory ID without emitting a Python bytes repr."""
+
+    return bytes(value).decode("ascii")
+
+
 @dataclass(frozen=True, slots=True)
 class CombinedPredictions:
     row_indices: NDArray[np.int64]
@@ -255,7 +261,7 @@ def run_one_position_backtest(
         outcome_counts[outcome] += 1
         trades.append(
             {
-                "decision_id": str(data.decision_ids[row]),
+                "decision_id": _decision_id_text(data.decision_ids[row]),
                 "fold": int(folds[selected_position]),
                 "decision_at_ns": decision_ns,
                 "exit_at_ns": exit_at_ns,

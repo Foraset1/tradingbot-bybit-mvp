@@ -38,7 +38,8 @@ def test_loads_expected_safe_defaults(config_path: Path) -> None:
     assert config.evaluation.calibration_days == 7
     assert config.evaluation.minimum_calibration_rows == 250
     assert config.evaluation.minimum_symbol_coverage_fraction == 0.95
-    assert config.evaluation.training_threads == 4
+    assert config.evaluation.logistic_max_training_rows == 500_000
+    assert config.evaluation.training_threads == 2
 
 
 def test_data_root_can_be_overridden(
@@ -186,9 +187,14 @@ def test_accepts_risk_values_below_mvp_caps(config_path: Path, tmp_path: Path) -
             r"within \[0, 100\]",
         ),
         (
-            "training_threads = 4",
+            "training_threads = 2",
             "training_threads = 0",
             "integer limits must be positive",
+        ),
+        (
+            "logistic_max_training_rows = 500000",
+            "logistic_max_training_rows = 500",
+            "cannot be shorter than minimum_train_rows",
         ),
         (
             "calibration_days = 7",

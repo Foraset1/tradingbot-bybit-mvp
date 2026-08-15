@@ -188,6 +188,7 @@ class EvaluationParameters:
     lightgbm_learning_rate: float
     lightgbm_num_leaves: int
     lightgbm_min_child_samples: int
+    logistic_max_training_rows: int
     training_threads: int
     random_seed: int
     max_notional_fraction: float
@@ -219,6 +220,7 @@ class EvaluationParameters:
             "lightgbm_learning_rate": self.lightgbm_learning_rate,
             "lightgbm_num_leaves": self.lightgbm_num_leaves,
             "lightgbm_min_child_samples": self.lightgbm_min_child_samples,
+            "logistic_max_training_rows": self.logistic_max_training_rows,
             "training_threads": self.training_threads,
             "random_seed": self.random_seed,
             "max_notional_fraction": self.max_notional_fraction,
@@ -248,7 +250,7 @@ class PreparedData:
     x: NDArray[np.float32]
     y: NDArray[np.int64]
     feature_names: tuple[str, ...]
-    decision_ids: NDArray[np.str_]
+    decision_ids: NDArray[np.bytes_]
     decision_at_ns: NDArray[np.int64]
     label_end_ns: NDArray[np.int64]
     hit_at_ns: NDArray[np.int64]

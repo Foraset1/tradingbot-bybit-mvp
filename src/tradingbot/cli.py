@@ -459,6 +459,9 @@ def _config_summary(config: AppConfig) -> dict[str, object]:
             "minimum_symbol_coverage_fraction": (
                 config.evaluation.minimum_symbol_coverage_fraction
             ),
+            "logistic_max_training_rows": (
+                config.evaluation.logistic_max_training_rows
+            ),
             "training_threads": config.evaluation.training_threads,
         },
         "mode": "public-read-only",

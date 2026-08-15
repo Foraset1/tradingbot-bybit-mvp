@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import logging
@@ -47,6 +48,7 @@ from tradingbot.research.models import (
     classification_metrics,
     fit_fold_models,
     fit_probability_calibrator,
+    release_unused_process_memory,
     timeout_return_estimate,
 )
 from tradingbot.research.splits import build_calibration_split, build_temporal_folds
@@ -113,6 +115,7 @@ def evaluation_parameters(config: AppConfig) -> EvaluationParameters:
         lightgbm_learning_rate=selected.lightgbm_learning_rate,
         lightgbm_num_leaves=selected.lightgbm_num_leaves,
         lightgbm_min_child_samples=selected.lightgbm_min_child_samples,
+        logistic_max_training_rows=selected.logistic_max_training_rows,
         training_threads=selected.training_threads,
         random_seed=selected.random_seed,
         max_notional_fraction=config.risk.max_notional_fraction,
@@ -126,9 +129,49 @@ def _matrix_view(
     rows: NDArray[np.int64],
     columns: NDArray[np.int64],
 ) -> NDArray[np.float32]:
+    row_matrix: NDArray[np.float32]
+    if len(rows) == 0:
+        row_matrix = data.x[:0]
+    else:
+        start = int(rows[0])
+        stop = int(rows[-1]) + 1
+        contiguous = (stop - start == len(rows)) and (
+            len(rows) == 1 or bool(np.all(rows[1:] > rows[:-1]))
+        )
+        # Temporal fit/calibration/test indices are contiguous in the sorted
+        # evaluation matrix. Preserve that as a view instead of copying up to
+        # ~750 MiB before every model fit.
+        row_matrix = data.x[start:stop] if contiguous else data.x[rows]
     if len(columns) == data.x.shape[1]:
-        return data.x[rows]
-    return data.x[np.ix_(rows, columns)]
+        return row_matrix
+    contiguous_columns = (
+        len(columns)
+        and int(columns[-1]) - int(columns[0]) + 1 == len(columns)
+        and (len(columns) == 1 or bool(np.all(columns[1:] > columns[:-1])))
+    )
+    if contiguous_columns:
+        return row_matrix[:, int(columns[0]) : int(columns[-1]) + 1]
+    return row_matrix[:, columns]
+
+
+def _release_preparation_memory(data: PreparedData) -> None:
+    """Release Arrow join buffers before scikit-learn allocates model matrices."""
+
+    arrow_before = int(pa.total_allocated_bytes())
+    gc.collect()
+    pa.default_memory_pool().release_unused()
+    gc.collect()
+    release_unused_process_memory()
+    arrow_after = int(pa.total_allocated_bytes())
+    LOGGER.info(
+        "Prepared %d rows: matrix %.1f MiB, compact IDs %.1f MiB; "
+        "Arrow pool %.1f -> %.1f MiB",
+        data.rows,
+        data.x.nbytes / 1024**2,
+        data.decision_ids.nbytes / 1024**2,
+        arrow_before / 1024**2,
+        arrow_after / 1024**2,
+    )
 
 
 def _sha256_file(path: Path) -> str:
@@ -334,6 +377,7 @@ def run_offline_evaluation(
             horizon_minutes=parameters.horizon_minutes,
             allowed_symbols=eligible_symbols,
         )
+        _release_preparation_memory(data)
         profile_columns = {
             profile: feature_profile_indices(data.feature_names, profile)
             for profile in FEATURE_PROFILES
@@ -423,8 +467,16 @@ def run_offline_evaluation(
                             "base_model": output.name,
                             "feature_profile": None,
                             "probability_variant": "raw",
+                            "training_rows_available": (
+                                output.training_rows_available
+                            ),
+                            "training_rows_used": output.training_rows_used,
                         }
                         profile_model_reports[output.name] = {
+                            "training_rows_available": (
+                                output.training_rows_available
+                            ),
+                            "training_rows_used": output.training_rows_used,
                             "raw": {
                                 "calibration_window": classification_metrics(
                                     data.y[calibration],
@@ -471,6 +523,10 @@ def run_offline_evaluation(
                             "base_model": output.name,
                             "feature_profile": profile,
                             "probability_variant": variant,
+                            "training_rows_available": (
+                                output.training_rows_available
+                            ),
+                            "training_rows_used": output.training_rows_used,
                         }
                         if output.feature_importance is not None:
                             importance_by_model[model_name].append(
@@ -480,6 +536,8 @@ def run_offline_evaluation(
                                 profile
                             ]
                     profile_model_reports[output.name] = {
+                        "training_rows_available": output.training_rows_available,
+                        "training_rows_used": output.training_rows_used,
                         "calibrator": calibrator.to_dict(),
                         "raw": {
                             "calibration_window": classification_metrics(

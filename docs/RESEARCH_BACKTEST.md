@@ -26,7 +26,8 @@
 3. до обучения исключает пары с coverage ниже `0.95` (BTC обязан пройти gate);
 4. строит expanding walk-forward folds без перемешивания времени;
 5. внутри каждого fold выделяет отдельные `fit → purge → calibration → purge → test` окна;
-6. обучает class-prior, logistic regression и LightGBM;
+6. обучает class-prior, logistic regression и LightGBM; LightGBM использует все fit-строки,
+   а logistic baseline — заранее ограниченную равномерную по времени выборку до 500 000 строк;
 7. сравнивает два заранее заданных feature profile: `full` и `no_calendar`;
 8. сохраняет raw и причинно calibrated вероятности;
 9. в каждую минуту выбирает максимум одну пару/сторону по expected net bps;
@@ -48,12 +49,22 @@
 | Features | `full`, `no_calendar` |
 | Probability | `raw`, `calibrated` |
 | Models | logistic, LightGBM (+ class-prior baseline) |
+| Logistic fit cap | 500 000 равномерных по времени fit-строк |
 | Primary candidate | `lightgbm_full_calibrated` |
 | Symbol coverage | минимум 95% |
 | История для review | минимум 365 завершённых UTC дней |
 
 Каждый horizon создаёт отдельный immutable `backtest-v2-*`. Все три результата должны быть
 сохранены; нельзя оставить только лучший.
+
+### Resource amendment до просмотра результатов
+
+Первый 365-дневный запуск H15 завершился кодом `137` во время первого logistic fit на
+3 323 622 строках. Ни predictions, ни report, ни метрики созданы не были. До повторного
+запуска зафиксирован ресурсный amendment для физического сервера 4 CPU / 8 GiB: cap logistic
+baseline в 500 000 равномерных по времени строк, два training threads, освобождение Arrow
+буферов и устранение полных копий contiguous fit-матрицы. Primary LightGBM, все его fit-строки,
+folds, horizons, признаки, calibration и торговые допущения не менялись.
 
 ## 365-дневный dataset
 
@@ -120,8 +131,10 @@ grep -Ei 'warning|error|traceback' "$LOG" || true
 
 ## Запуск трёх V2 экспериментов
 
-Запуски выполняются последовательно: два параллельных LightGBM процесса могут мешать
-collector и превысить 10 GiB RAM.
+Запуски выполняются последовательно. Профиль ниже рассчитан на физический сервер с 4 CPU и
+8 GiB RAM: исследовательский контейнер ограничен 6 GiB и двумя потоками, оставляя ресурсы
+collector и ОС. Logistic является диагностическим baseline и использует детерминированную
+500-тысячную выборку; основной LightGBM по-прежнему обучается на всех fit-строках.
 
 ```bash
 set +e
@@ -133,7 +146,8 @@ RESEARCH_DATASET=$(jq -er '.dataset_path' "$PRICE_RESULT") || exit 1
 for HORIZON in 15 30 60; do
   RESULT="$REPORT_DIR/backtest-v2-price-365d-h${HORIZON}-build.json"
   LOG="$REPORT_DIR/backtest-v2-price-365d-h${HORIZON}.log"
-  TRADINGBOT_COLLECTOR_MEMORY=8g docker compose run --rm --no-deps collector \
+  TRADINGBOT_COLLECTOR_MEMORY=6g TRADINGBOT_COLLECTOR_CPUS=2.0 \
+  docker compose run --rm --no-deps collector \
     python -m tradingbot run-backtest \
     --research-dataset "$RESEARCH_DATASET" \
     --output-root /data/evaluations \
@@ -149,6 +163,10 @@ done
 
 Эту команду также следует выполнять в отдельной `tmux`-сессии. Она может работать несколько
 часов. Collector должен оставаться `healthy`.
+
+Лог печатает RSS перед и после logistic/LightGBM. Код `137` означает, что процесс превысил
+доступную память; нельзя запускать второй horizon параллельно или повторять его с лимитом 8g
+на физическом сервере, где всего 8 GiB RAM.
 
 ## Результаты
 
@@ -171,6 +189,7 @@ done
 
 - eligibility/exclusion и coverage каждой пары;
 - границы fit/calibration/test и доказательство purge;
+- доступное и фактически использованное число обучающих строк для каждой модели;
 - raw/calibrated log loss, Brier, ECE и частоты классов;
 - cost-aware backtest и zero-cost same-trades comparison;
 - breakdown по fold, symbol, side, outcome, EV bins и deciles;

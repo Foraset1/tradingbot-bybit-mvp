@@ -60,7 +60,8 @@
 - отдельные triple-barrier labels 5/15/30/60 минут без ложного `maker fill`;
 - атомарный versioned research dataset с проверяемыми fingerprint и provenance;
 - purged walk-forward split с 60-минутным embargo и явным режимом короткого smoke-test;
-- class-prior и logistic baseline, а также детерминированный глобальный LightGBM;
+- class-prior и ограниченный равномерной по времени выборкой logistic baseline, а также
+  детерминированный глобальный LightGBM на всех fit-строках;
 - backtest, выбирающий одну пару/сторону и учитывающий комиссии, slippage, funding,
   лимит номинала, одну позицию и rolling 24h loss gate;
 - versioned evaluation report, модели и Parquet-ledger сделок с SHA-256 проверкой;
@@ -124,6 +125,11 @@ Production-профиль рассчитан на VM с 6 vCPU, 10 GB RAM и д�
 умолчанию ограничен 4 CPU и 6 GB через `.env`, поэтому значения можно уменьшить без правки
 Compose-файла. Данные и health-файл сохраняются в именованных Docker volumes `market-data` и
 `collector-runtime`.
+
+Offline evaluation также поддерживает физический узел с 4 CPU / 8 GB RAM: запуски идут
+строго последовательно с лимитом 2 CPU / 6 GB, освобождением Arrow-буферов, компактными ID и
+детерминированным cap в 500 000 строк только для logistic baseline. Primary LightGBM и
+365-дневные temporal folds не сокращаются.
 
 Стаканы и сделки могут давать несколько гигабайт необжатых данных в сутки. В локальном
 90-секундном smoke-test было записано 2 835 799 байт — грубая экстраполяция около
