@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import ctypes
+import gc
 import logging
+import sys
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -11,6 +14,7 @@ from sklearn.impute import SimpleImputer  # type: ignore[import-untyped]
 from sklearn.linear_model import LogisticRegression  # type: ignore[import-untyped]
 from sklearn.pipeline import Pipeline  # type: ignore[import-untyped]
 from sklearn.preprocessing import StandardScaler  # type: ignore[import-untyped]
+from threadpoolctl import threadpool_limits  # type: ignore[import-untyped]
 
 from tradingbot.research.evaluation_contracts import (
     OUTCOME_NAMES,
@@ -31,6 +35,70 @@ class ModelPrediction:
     probabilities: NDArray[np.float64]
     model_text: str | None
     feature_importance: NDArray[np.float64] | None
+    training_rows_available: int
+    training_rows_used: int
+
+
+def _resident_memory_mib() -> float | None:
+    """Return current Linux RSS for operational telemetry when available."""
+
+    try:
+        with open("/proc/self/status", encoding="ascii") as status:
+            for line in status:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def release_unused_process_memory() -> None:
+    """Return released native allocations to Linux between large model fits."""
+
+    gc.collect()
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        trim = cast(Any, ctypes.CDLL(None).malloc_trim)
+        trim(0)
+    except (AttributeError, OSError):
+        return
+
+
+def _time_uniform_training_sample(
+    x_train: NDArray[np.float32],
+    y_train: NDArray[np.int64],
+    *,
+    maximum_rows: int,
+) -> tuple[NDArray[np.float32], NDArray[np.int64]]:
+    """Bound the baseline fit deterministically while retaining the full time span."""
+
+    if maximum_rows <= 0:
+        raise EvaluationError("logistic maximum training rows must be positive")
+    if len(x_train) != len(y_train):
+        raise EvaluationError("training feature and target rows do not match")
+    if maximum_rows < len(OUTCOME_NAMES):
+        raise EvaluationError(
+            "logistic maximum training rows must cover every outcome"
+        )
+    if len(y_train) <= maximum_rows:
+        return x_train, y_train
+    indices = np.linspace(
+        0,
+        len(y_train) - 1,
+        num=maximum_rows,
+        dtype=np.int64,
+    )
+    sampled_outcomes = set(int(value) for value in y_train[indices])
+    for outcome_index in range(len(OUTCOME_NAMES)):
+        if outcome_index in sampled_outcomes:
+            continue
+        matching = np.flatnonzero(y_train == outcome_index)
+        if not len(matching):
+            raise EvaluationError("logistic training rows do not contain every outcome")
+        indices[outcome_index] = int(matching[len(matching) // 2])
+    indices.sort()
+    return x_train[indices], y_train[indices]
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +235,8 @@ def _prior_prediction(
         probabilities=np.repeat(probabilities[None, :], test_rows, axis=0),
         model_text=None,
         feature_importance=None,
+        training_rows_available=len(y_train),
+        training_rows_used=len(y_train),
     )
 
 
@@ -177,7 +247,21 @@ def _logistic_prediction(
     x_test: NDArray[np.float32],
     *,
     seed: int,
+    maximum_training_rows: int,
+    training_threads: int,
 ) -> ModelPrediction:
+    available_rows = len(y_train)
+    x_fit, y_fit = _time_uniform_training_sample(
+        x_train,
+        y_train,
+        maximum_rows=maximum_training_rows,
+    )
+    LOGGER.info(
+        "Fitting logistic baseline on %d/%d time-uniform rows (RSS %.1f MiB)",
+        len(y_fit),
+        available_rows,
+        _resident_memory_mib() or -1.0,
+    )
     pipeline: Pipeline = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="median", add_indicator=True)),
@@ -193,19 +277,26 @@ def _logistic_prediction(
             ),
         ]
     )
-    pipeline.fit(x_train, y_train)
+    with threadpool_limits(limits=training_threads):
+        pipeline.fit(x_fit, y_fit)
     classifier = cast(Any, pipeline.named_steps["classifier"])
     classes = np.asarray(classifier.classes_, dtype=np.int64)
     calibration_raw = np.asarray(
         pipeline.predict_proba(x_calibration), dtype=np.float64
     )
     test_raw = np.asarray(pipeline.predict_proba(x_test), dtype=np.float64)
+    LOGGER.info(
+        "Logistic baseline ready (RSS %.1f MiB)",
+        _resident_memory_mib() or -1.0,
+    )
     return ModelPrediction(
         name="logistic",
         calibration_probabilities=_aligned_probabilities(calibration_raw, classes),
         probabilities=_aligned_probabilities(test_raw, classes),
         model_text=None,
         feature_importance=None,
+        training_rows_available=available_rows,
+        training_rows_used=len(y_fit),
     )
 
 
@@ -216,6 +307,12 @@ def _lightgbm_prediction(
     x_test: NDArray[np.float32],
     parameters: EvaluationParameters,
 ) -> ModelPrediction:
+    LOGGER.info(
+        "Fitting LightGBM on %d rows with %d threads (RSS %.1f MiB)",
+        len(y_train),
+        parameters.training_threads,
+        _resident_memory_mib() or -1.0,
+    )
     model = LGBMClassifier(
         objective="multiclass",
         num_class=len(OUTCOME_NAMES),
@@ -235,12 +332,14 @@ def _lightgbm_prediction(
         bagging_seed=parameters.random_seed,
         verbosity=-1,
     )
-    model.fit(x_train, y_train)
+    with threadpool_limits(limits=parameters.training_threads):
+        model.fit(x_train, y_train)
     classes = np.asarray(model.classes_, dtype=np.int64)
     calibration_raw = np.asarray(
         model.predict_proba(x_calibration), dtype=np.float64
     )
     test_raw = np.asarray(model.predict_proba(x_test), dtype=np.float64)
+    LOGGER.info("LightGBM ready (RSS %.1f MiB)", _resident_memory_mib() or -1.0)
     booster = model.booster_
     return ModelPrediction(
         name="lightgbm",
@@ -250,6 +349,8 @@ def _lightgbm_prediction(
         feature_importance=np.asarray(
             booster.feature_importance(importance_type="gain"), dtype=np.float64
         ),
+        training_rows_available=len(y_train),
+        training_rows_used=len(y_train),
     )
 
 
@@ -270,23 +371,26 @@ def fit_fold_models(
         len(x_calibration),
         len(x_test),
     )
-    return (
-        _prior_prediction(y_train, len(x_calibration), len(x_test)),
-        _logistic_prediction(
-            x_train,
-            y_train,
-            x_calibration,
-            x_test,
-            seed=parameters.random_seed,
-        ),
-        _lightgbm_prediction(
-            x_train,
-            y_train,
-            x_calibration,
-            x_test,
-            parameters,
-        ),
+    prior = _prior_prediction(y_train, len(x_calibration), len(x_test))
+    logistic = _logistic_prediction(
+        x_train,
+        y_train,
+        x_calibration,
+        x_test,
+        seed=parameters.random_seed,
+        maximum_training_rows=parameters.logistic_max_training_rows,
+        training_threads=parameters.training_threads,
     )
+    release_unused_process_memory()
+    lightgbm_prediction = _lightgbm_prediction(
+        x_train,
+        y_train,
+        x_calibration,
+        x_test,
+        parameters,
+    )
+    release_unused_process_memory()
+    return prior, logistic, lightgbm_prediction
 
 
 def classification_metrics(

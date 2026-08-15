@@ -99,6 +99,7 @@ class EvaluationConfig:
     lightgbm_learning_rate: float
     lightgbm_num_leaves: int
     lightgbm_min_child_samples: int
+    logistic_max_training_rows: int
     training_threads: int
     random_seed: int
 
@@ -261,6 +262,7 @@ def _validate_evaluation(config: EvaluationConfig, risk: RiskConfig) -> None:
         "lightgbm_estimators": config.lightgbm_estimators,
         "lightgbm_num_leaves": config.lightgbm_num_leaves,
         "lightgbm_min_child_samples": config.lightgbm_min_child_samples,
+        "logistic_max_training_rows": config.logistic_max_training_rows,
         "training_threads": config.training_threads,
     }
     if any(value <= 0 for value in positive_integers.values()):
@@ -274,6 +276,11 @@ def _validate_evaluation(config: EvaluationConfig, risk: RiskConfig) -> None:
     if config.calibration_days >= config.minimum_train_days:
         raise ConfigError(
             "evaluation.calibration_days must be shorter than minimum_train_days"
+        )
+    if config.logistic_max_training_rows < config.minimum_train_rows:
+        raise ConfigError(
+            "evaluation.logistic_max_training_rows cannot be shorter than "
+            "minimum_train_rows"
         )
     if not 0 < config.minimum_symbol_coverage_fraction <= 1:
         raise ConfigError(
@@ -588,6 +595,10 @@ def load_config(path: str | Path) -> AppConfig:
         lightgbm_min_child_samples=_integer(
             _required(evaluation_raw, "lightgbm_min_child_samples", "evaluation"),
             "evaluation.lightgbm_min_child_samples",
+        ),
+        logistic_max_training_rows=_integer(
+            _required(evaluation_raw, "logistic_max_training_rows", "evaluation"),
+            "evaluation.logistic_max_training_rows",
         ),
         training_threads=_integer(
             _required(evaluation_raw, "training_threads", "evaluation"),
