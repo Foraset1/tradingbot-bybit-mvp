@@ -15,7 +15,7 @@
 
 При наблюдаемом объёме около 2,71 GB/сутки диск 100 GB не подходит для бессрочного хранения
 JSONL. Целевое локальное окно raw — 7 дней с суточным Parquet-архивированием; disk guard
-сохраняет не менее 15 GiB свободного места. Версия 0.6.0 формирует проверяемый dry-run
+сохраняет не менее 15 GiB свободного места. Текущая реализация формирует проверяемый dry-run
 retention, но сама старые данные ещё не удаляет. Порядок запуска описан в
 [`DAILY_ARCHIVE.md`](DAILY_ARCHIVE.md).
 
@@ -309,6 +309,23 @@ fingerprint, число feature/label строк и файлов. Повторн
 возвращает `reused=true`. Контракт описан в
 [`FEATURES_AND_LABELS.md`](FEATURES_AND_LABELS.md).
 
+Для V3 из live-каталога отдельно строятся консервативные maker-fill labels. Сборка идёт
+посуточно и держит в памяти не более трёх соседних разделов одного символа:
+
+```bash
+sudo docker compose run --rm --no-deps collector \
+  python -m tradingbot build-execution-research \
+  --catalog /data/archive/catalog.json \
+  --output-root /data/execution-research \
+  > "$REPORT_DIR/execution-v3-build-result.json" \
+  2> "$REPORT_DIR/execution-v3.log"
+sudo chown foraset1:foraset1 \
+  "$REPORT_DIR/execution-v3-build-result.json" "$REPORT_DIR/execution-v3.log"
+```
+
+Полный порядок запуска в `tmux`, assumptions и границы интерпретации описаны в
+[`EXECUTION_RESEARCH.md`](EXECUTION_RESEARCH.md).
+
 Offline baseline/LightGBM/backtest запускается из конкретного неизменяемого research dataset:
 
 ```bash
@@ -331,10 +348,11 @@ sudo docker compose run --rm --no-deps collector \
 sudo chown foraset1:foraset1 "$REPORT_DIR"/*.json
 ```
 
-На текущих 72 часах ожидается `data_mode: technical_smoke`: это проверка всего конвейера,
-а не качества или доходности модели. Обычные временные окна требуют минимум 44 дней;
-зафиксированный V2 model review — минимум 365 дней и три folds. Подробный контракт находится в
-[`RESEARCH_BACKTEST.md`](RESEARCH_BACKTEST.md).
+История короче 44 дней получает только `data_mode: technical_smoke`. Проведённый V2 review
+на 365 днях не разрешил торговлю: H15 оказался редким и нестабильным по folds, H30/H60 —
+отрицательными. Подробный контракт находится в
+[`RESEARCH_BACKTEST.md`](RESEARCH_BACKTEST.md); следующий расчёт должен использовать V3
+execution labels.
 
 Для физического узла с 4 CPU / 8 GB горизонты запускаются только последовательно. Конфигурация
 ограничивает обучение двумя потоками и 6 GiB на исследовательский контейнер; logistic baseline

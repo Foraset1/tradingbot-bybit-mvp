@@ -118,6 +118,66 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="Research dataset parent directory (defaults to research beside storage.root)",
     )
+    execution_research = subparsers.add_parser(
+        "build-execution-research",
+        help="Build conservative maker-fill and post-fill labels from live microstructure",
+    )
+    execution_source = execution_research.add_mutually_exclusive_group(required=True)
+    execution_source.add_argument(
+        "--dataset",
+        type=Path,
+        help="Canonical dataset directory containing manifest.json",
+    )
+    execution_source.add_argument(
+        "--catalog",
+        type=Path,
+        help="Daily archive catalog.json used as a multi-day canonical source",
+    )
+    execution_research.add_argument(
+        "--output-root",
+        type=Path,
+        default=None,
+        help="Execution dataset parent (defaults to execution-research beside storage.root)",
+    )
+    execution_research.add_argument(
+        "--horizon-minutes",
+        type=int,
+        action="append",
+        choices=(15, 30),
+        default=None,
+        help="Repeat to override the pre-registered 15/30 minute horizons",
+    )
+    execution_research.add_argument(
+        "--order-notional-usdt",
+        type=float,
+        action="append",
+        default=None,
+        help="Repeat to override the 50/100/250/500 USDT reference sizes",
+    )
+    execution_research.add_argument(
+        "--submission-latency-ms",
+        type=int,
+        default=None,
+        help="Decision-to-submission latency (default: 250 ms)",
+    )
+    execution_research.add_argument(
+        "--activation-max-delay-ms",
+        type=int,
+        default=None,
+        help="Maximum wait for the first observable activation book (default: 2500 ms)",
+    )
+    execution_research.add_argument(
+        "--entry-ttl-seconds",
+        type=int,
+        default=None,
+        help="Maker order lifetime from the decision timestamp (default: 30 s)",
+    )
+    execution_research.add_argument(
+        "--queue-ahead-multiplier",
+        type=float,
+        default=None,
+        help="Conservative visible queue multiplier, at least 1.0 (default: 1.0)",
+    )
     price_research = subparsers.add_parser(
         "build-price-research",
         help="Build causal price-only research from official Bybit history",
@@ -553,6 +613,90 @@ def _run_build_research(
     print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
 
 
+def _run_build_execution_research(
+    config: AppConfig,
+    dataset: Path | None,
+    catalog: Path | None,
+    output_root: Path | None,
+    horizons: list[int] | None,
+    order_notionals: list[float] | None,
+    submission_latency_ms: int | None,
+    activation_max_delay_ms: int | None,
+    entry_ttl_seconds: int | None,
+    queue_ahead_multiplier: float | None,
+) -> None:
+    try:
+        from tradingbot.research.contracts import (
+            ExecutionResearchParameters,
+            ResearchBuildError,
+        )
+        from tradingbot.research.execution_builder import (
+            build_execution_research_dataset,
+            build_execution_research_dataset_from_catalog,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name in {"numpy", "pyarrow"} or (exc.name or "").startswith(
+            ("numpy.", "pyarrow.")
+        ):
+            LOGGER.error(
+                "Execution research support is not installed; install the project "
+                "with the [research] extra"
+            )
+            raise SystemExit(1) from exc
+        raise
+
+    parameters = ExecutionResearchParameters()
+    if horizons is not None:
+        parameters = replace(
+            parameters, position_horizons_minutes=tuple(horizons)
+        )
+    if order_notionals is not None:
+        parameters = replace(
+            parameters, order_notionals_usdt=tuple(order_notionals)
+        )
+    if submission_latency_ms is not None:
+        parameters = replace(
+            parameters, submission_latency_ms=submission_latency_ms
+        )
+    if activation_max_delay_ms is not None:
+        parameters = replace(
+            parameters, activation_max_delay_ms=activation_max_delay_ms
+        )
+    if entry_ttl_seconds is not None:
+        parameters = replace(parameters, entry_ttl_seconds=entry_ttl_seconds)
+    if queue_ahead_multiplier is not None:
+        parameters = replace(
+            parameters, queue_ahead_multiplier=queue_ahead_multiplier
+        )
+
+    destination = (
+        config.storage.root.parent / "execution-research"
+        if output_root is None
+        else output_root
+    )
+    try:
+        if catalog is not None:
+            result = build_execution_research_dataset_from_catalog(
+                archive_catalog=catalog,
+                output_root=destination,
+                parameters=parameters,
+                minimum_free_bytes=config.storage.min_free_bytes,
+            )
+        elif dataset is not None:
+            result = build_execution_research_dataset(
+                canonical_dataset=dataset,
+                output_root=destination,
+                parameters=parameters,
+                minimum_free_bytes=config.storage.min_free_bytes,
+            )
+        else:  # guarded by argparse, retained for direct callers
+            raise ResearchBuildError("one execution research source must be selected")
+    except ResearchBuildError as exc:
+        LOGGER.error("Execution research build rejected: %s", exc)
+        raise SystemExit(1) from exc
+    print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+
+
 def _run_build_price_research(
     config: AppConfig,
     catalog: Path,
@@ -836,6 +980,20 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.dataset,
             args.catalog,
             args.output_root,
+        )
+        return
+    if args.command == "build-execution-research":
+        _run_build_execution_research(
+            config,
+            args.dataset,
+            args.catalog,
+            args.output_root,
+            args.horizon_minutes,
+            args.order_notional_usdt,
+            args.submission_latency_ms,
+            args.activation_max_delay_ms,
+            args.entry_ttl_seconds,
+            args.queue_ahead_multiplier,
         )
         return
     if args.command == "build-price-research":
