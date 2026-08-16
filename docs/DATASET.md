@@ -113,4 +113,4 @@ Fingerprint входа связывает raw snapshot, audit и канонич�
 Для постоянного сбора действует отдельный суточный контракт: audit и canonical manifest
 сохраняются навсегда, а старый raw может стать кандидатом retention только после полной
 проверки Parquet и повторного совпадения raw SHA-256. Этот процесс описан в
-[`DAILY_ARCHIVE.md`](DAILY_ARCHIVE.md); версия 0.5.0 сама файлы не удаляет.
+[`DAILY_ARCHIVE.md`](DAILY_ARCHIVE.md); текущая реализация сама файлы не удаляет.

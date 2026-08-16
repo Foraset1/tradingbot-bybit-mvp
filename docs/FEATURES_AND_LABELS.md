@@ -9,8 +9,8 @@
 Система остаётся полностью read-only. Здесь нет API-ключей, ордеров, позиции, оценки
 maker fill или решения «торговать».
 
-Существуют два несовместимых по входным данным, но совместимых с offline evaluator
-research-профиля:
+Для модели движения рынка существуют два несовместимых по входным данным, но совместимых
+с offline evaluator research-профиля:
 
 - `microstructure_research_v1` — live orderbook/trades/ticker/kline с локальными
   `received_at_ns`;
@@ -19,6 +19,10 @@ research-профиля:
 
 Второй профиль строится командой `build-price-research`; отсутствующие признаки не входят
 в его Arrow-схему и модель, а не заполняются искусственными нулями.
+
+Третий профиль `execution_microstructure_v1` не заменяет эти market labels. Он отдельно
+оценивает `PostOnly`, видимую очередь, `NO_FILL/PARTIAL_FILL/FULL_FILL` и post-fill outcome.
+Его контракт и запуск описаны в [`EXECUTION_RESEARCH.md`](EXECUTION_RESEARCH.md).
 
 ## Входной gate
 
@@ -133,8 +137,9 @@ Label создаётся только когда trade stream покрывает
 не превращается в ложный `TIMEOUT`; число пропусков записывается в manifest.
 
 Labels описывают движение публичного рынка. Они **не доказывают**, что `PostOnly` entry был
-исполнен, не моделируют очередь, partial fill или реальное stop slippage. `NO_FILL` остаётся
-execution label будущего simulator stage.
+исполнен, не моделируют очередь, partial fill или реальное stop slippage. Эти свойства
+намеренно вынесены в отдельный V3 dataset `execution_microstructure_v1`; market label нельзя
+молча подменять его execution label.
 
 Комиссии maker/taker, adverse selection, funding и stress slippage применяются на следующем
 этапе backtest до присвоения кандидату решения «торговать». Они намеренно не зашиты в
@@ -166,9 +171,10 @@ PyArrow/NumPy. В manifest находятся:
 атомарно переименовывается. Повторный запуск с тем же входом не переписывает данные, а
 проверяет все файлы и возвращает `reused=true`.
 
-## Ограничение текущего snapshot
+## Ограничение истории
 
-Принятые 24 часа нужны для end-to-end проверки сборщика и pipeline. Они не покрывают
-достаточное число рыночных режимов, недель, funding cycles и стресс-событий. На этом наборе
-нельзя честно оценить прибыльность или принять модель. Для стадии LightGBM/walk-forward
-нужно продолжать сбор и отдельно получить длительную историю доступных market streams.
+Короткий live snapshot пригоден для end-to-end проверки, но не покрывает достаточное число
+рыночных режимов, недель, funding cycles и стресс-событий. Официальная price-only история
+расширяет market-movement test, но не заменяет live L50 для execution-модели. Вывод о
+прибыльности запрещён, пока не пройдены execution-aware backtest, независимый shadow
+holdout и paper/testnet калибровка.

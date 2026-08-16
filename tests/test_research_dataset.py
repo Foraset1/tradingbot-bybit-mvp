@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import Counter
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -24,10 +25,22 @@ from tradingbot.data.canonical import (
     _dataset_files_fingerprint,
 )
 from tradingbot.research.builder import (
+    NS_PER_SECOND,
+    _OrderBookSeries,
     _TradeSeries,
     build_research_dataset,
 )
-from tradingbot.research.contracts import ResearchBuildError
+from tradingbot.research.contracts import (
+    ExecutionResearchParameters,
+    ResearchBuildError,
+)
+from tradingbot.research.execution_builder import (
+    _activation_snapshot,
+    _execution_label_rows,
+    _maker_fill,
+    _maker_fills,
+    build_execution_research_dataset,
+)
 
 BASE_TS_MS = 1_800_000_000_000
 MINUTE_MS = 60_000
@@ -408,4 +421,477 @@ def test_build_research_cli_prints_summary(
     assert summary["research_schema_version"] == 1
     assert summary["feature_rows"] > 0
     assert summary["label_rows"] > 0
+    assert summary["reused"] is False
+
+
+def test_execution_parameters_reject_optimistic_or_unbounded_assumptions() -> None:
+    defaults = ExecutionResearchParameters()
+    defaults.validate()
+
+    with pytest.raises(ResearchBuildError, match="at least 1.0"):
+        replace(defaults, queue_ahead_multiplier=0.99).validate()
+    with pytest.raises(ResearchBuildError, match="unique, positive"):
+        replace(defaults, order_notionals_usdt=(100.0, 50.0)).validate()
+    with pytest.raises(ResearchBuildError, match="one-hour"):
+        replace(defaults, position_horizons_minutes=(15, 90)).validate()
+    with pytest.raises(ResearchBuildError, match="must remain 60"):
+        replace(defaults, volatility_lookback_minutes=30).validate()
+    with pytest.raises(ResearchBuildError, match="extend beyond"):
+        replace(
+            defaults,
+            submission_latency_ms=500,
+            activation_max_delay_ms=2_500,
+            entry_ttl_seconds=3,
+        ).validate()
+
+
+def test_activation_snapshot_uses_observed_queue_and_post_only_guard() -> None:
+    submitted_at_ns = BASE_TS_MS * 1_000_000
+    table = pa.table(
+        {
+            "received_at_ns": [submitted_at_ns + 100_000_000],
+            "bid_prices": [[100.0, 99.5]],
+            "bid_sizes": [[3.0, 4.0]],
+            "ask_prices": [[101.0, 101.5]],
+            "ask_sizes": [[5.0, 6.0]],
+        }
+    )
+    books = _OrderBookSeries(table)
+
+    exact, reason = _activation_snapshot(
+        books,
+        submitted_at_ns=submitted_at_ns,
+        activation_max_delay_ms=500,
+        side="LONG",
+        entry_price=100.0,
+    )
+    assert reason is None
+    assert exact is not None
+    assert exact.post_only_valid is True
+    assert exact.queue_ahead_size == 3.0
+
+    inside, reason = _activation_snapshot(
+        books,
+        submitted_at_ns=submitted_at_ns,
+        activation_max_delay_ms=500,
+        side="LONG",
+        entry_price=100.5,
+    )
+    assert reason is None
+    assert inside is not None
+    assert inside.queue_ahead_size == 0.0
+
+    crossing, reason = _activation_snapshot(
+        books,
+        submitted_at_ns=submitted_at_ns,
+        activation_max_delay_ms=500,
+        side="LONG",
+        entry_price=101.0,
+    )
+    assert reason is None
+    assert crossing is not None
+    assert crossing.post_only_valid is False
+    assert crossing.queue_ahead_size is None
+
+
+def _fill_trade_series(
+    *,
+    prices: list[float],
+    sizes: list[float],
+    sides: list[str],
+) -> tuple[_TradeSeries, int, int]:
+    activation_at_ns = BASE_TS_MS * 1_000_000
+    received = [
+        activation_at_ns + (index + 1) * 1_000_000_000
+        for index in range(len(prices))
+    ]
+    table = pa.table(
+        {
+            "received_at_ns": received,
+            "event_ts_ms": [BASE_TS_MS + (index + 1) * 1_000 for index in range(len(prices))],
+            "sequence": list(range(1, len(prices) + 1)),
+            "side": sides,
+            "price": prices,
+            "size": sizes,
+        }
+    )
+    return _TradeSeries(table), activation_at_ns, received[-1]
+
+
+def test_maker_fill_requires_queue_and_full_order_volume() -> None:
+    trades, activation_at_ns, end_ns = _fill_trade_series(
+        prices=[100.0, 100.0, 100.0, 101.0],
+        sizes=[1.0, 0.25, 0.25, 1.0],
+        sides=["Sell", "Sell", "Sell", "Buy"],
+    )
+    result = _maker_fill(
+        trades,
+        activation_at_ns=activation_at_ns,
+        entry_window_end_ns=end_ns,
+        side="LONG",
+        entry_price=100.0,
+        queue_ahead_size=1.0,
+        order_size=0.5,
+        queue_ahead_multiplier=1.0,
+    )
+
+    assert result is not None
+    assert result.status == "FULL_FILL"
+    assert result.resolution == "visible_queue_depleted_by_public_trades"
+    assert result.first_fill_index == 1
+    assert result.full_fill_index == 2
+    assert result.filled_size == 0.5
+    assert result.contra_volume_at_entry_price == 1.5
+
+
+def test_bulk_maker_fill_scans_one_window_for_multiple_sizes() -> None:
+    trades, activation_at_ns, end_ns = _fill_trade_series(
+        prices=[100.0, 100.0, 101.0],
+        sizes=[1.25, 0.25, 1.0],
+        sides=["Sell", "Sell", "Buy"],
+    )
+
+    results = _maker_fills(
+        trades,
+        activation_at_ns=activation_at_ns,
+        entry_window_end_ns=end_ns,
+        side="LONG",
+        entry_price=100.0,
+        queue_ahead_size=1.0,
+        order_sizes=(0.25, 1.0),
+        queue_ahead_multiplier=1.0,
+    )
+
+    assert results is not None
+    small, large = results
+    assert small.status == "FULL_FILL"
+    assert small.full_fill_index == 0
+    assert large.status == "PARTIAL_FILL"
+    assert large.filled_size == pytest.approx(0.5)
+
+
+def test_maker_fill_ignores_block_and_rpi_prints() -> None:
+    activation_at_ns = BASE_TS_MS * 1_000_000
+    received = [
+        activation_at_ns + NS_PER_SECOND,
+        activation_at_ns + 2 * NS_PER_SECOND,
+        activation_at_ns + 3 * NS_PER_SECOND,
+    ]
+    trades = _TradeSeries(
+        pa.table(
+            {
+                "received_at_ns": received,
+                "event_ts_ms": [BASE_TS_MS + 1_000, BASE_TS_MS + 2_000, BASE_TS_MS + 3_000],
+                "sequence": [1, 2, 3],
+                "side": ["Sell", "Sell", "Buy"],
+                "price": [99.0, 99.0, 101.0],
+                "size": [10.0, 10.0, 1.0],
+                "is_block_trade": [True, False, False],
+                "is_rpi_trade": [False, True, False],
+            }
+        )
+    )
+
+    result = _maker_fill(
+        trades,
+        activation_at_ns=activation_at_ns,
+        entry_window_end_ns=received[-1],
+        side="LONG",
+        entry_price=100.0,
+        queue_ahead_size=0.0,
+        order_size=1.0,
+        queue_ahead_multiplier=1.0,
+    )
+
+    assert result is not None
+    assert result.status == "NO_FILL"
+    assert result.contra_trade_count == 0
+
+    market_outcome = trades.barrier_outcome(
+        decision_at_ns=activation_at_ns,
+        label_end_ns=received[-1],
+        side="LONG",
+        entry_price=100.0,
+        stop_price=99.5,
+        take_profit_price=102.0,
+        stop_distance_bps=50.0,
+        take_profit_distance_bps=200.0,
+    )
+    execution_outcome = trades.barrier_outcome(
+        decision_at_ns=activation_at_ns,
+        label_end_ns=received[-1],
+        side="LONG",
+        entry_price=100.0,
+        stop_price=99.5,
+        take_profit_price=102.0,
+        stop_distance_bps=50.0,
+        take_profit_distance_bps=200.0,
+        execution_eligible_only=True,
+    )
+    assert market_outcome is not None
+    assert market_outcome.outcome == "SL_FIRST"
+    assert execution_outcome is not None
+    assert execution_outcome.outcome == "TIMEOUT"
+    assert execution_outcome.timeout_price == 101.0
+
+
+def test_maker_fill_retains_partial_and_price_through_cases() -> None:
+    partial_trades, activation_at_ns, end_ns = _fill_trade_series(
+        prices=[100.0, 100.0, 101.0],
+        sizes=[1.0, 0.4, 1.0],
+        sides=["Sell", "Sell", "Buy"],
+    )
+    partial = _maker_fill(
+        partial_trades,
+        activation_at_ns=activation_at_ns,
+        entry_window_end_ns=end_ns,
+        side="LONG",
+        entry_price=100.0,
+        queue_ahead_size=1.0,
+        order_size=1.0,
+        queue_ahead_multiplier=1.0,
+    )
+    assert partial is not None
+    assert partial.status == "PARTIAL_FILL"
+    assert partial.filled_size == pytest.approx(0.4)
+
+    through_trades, activation_at_ns, end_ns = _fill_trade_series(
+        prices=[99.5, 101.0],
+        sizes=[0.01, 1.0],
+        sides=["Sell", "Buy"],
+    )
+    through = _maker_fill(
+        through_trades,
+        activation_at_ns=activation_at_ns,
+        entry_window_end_ns=end_ns,
+        side="LONG",
+        entry_price=100.0,
+        queue_ahead_size=100.0,
+        order_size=1.0,
+        queue_ahead_multiplier=1.0,
+    )
+    assert through is not None
+    assert through.status == "FULL_FILL"
+    assert through.resolution == "public_trade_through_entry_price"
+    assert through.full_fill_index == 0
+
+    expiry_trades, activation_at_ns, expiry_ns = _fill_trade_series(
+        prices=[100.0],
+        sizes=[2.0],
+        sides=["Sell"],
+    )
+    at_expiry = _maker_fill(
+        expiry_trades,
+        activation_at_ns=activation_at_ns,
+        entry_window_end_ns=expiry_ns,
+        side="LONG",
+        entry_price=100.0,
+        queue_ahead_size=0.0,
+        order_size=1.0,
+        queue_ahead_multiplier=1.0,
+    )
+    assert at_expiry is not None
+    assert at_expiry.status == "NO_FILL"
+
+
+def test_barrier_evaluation_keeps_later_trade_with_same_receive_time() -> None:
+    received_at_ns = BASE_TS_MS * 1_000_000
+    trades = _TradeSeries(
+        pa.table(
+            {
+                "received_at_ns": [received_at_ns, received_at_ns],
+                "event_ts_ms": [BASE_TS_MS, BASE_TS_MS + 1],
+                "sequence": [10, 11],
+                "side": ["Sell", "Buy"],
+                "price": [100.0, 102.0],
+                "size": [1.0, 1.0],
+            }
+        )
+    )
+
+    outcome = trades.barrier_outcome(
+        decision_at_ns=received_at_ns,
+        label_end_ns=received_at_ns,
+        side="LONG",
+        entry_price=100.0,
+        stop_price=99.0,
+        take_profit_price=101.0,
+        stop_distance_bps=100.0,
+        take_profit_distance_bps=100.0,
+        start_after_index=0,
+    )
+
+    assert outcome is not None
+    assert outcome.outcome == "TP_FIRST"
+    assert outcome.hit_index == 1
+    assert outcome.future_trade_count == 1
+
+
+def test_execution_label_starts_market_outcome_after_full_fill() -> None:
+    decision_at_ns = BASE_TS_MS * 1_000_000
+    books = _OrderBookSeries(
+        pa.table(
+            {
+                "received_at_ns": [decision_at_ns + 100_000_000],
+                "bid_prices": [[100.0, 99.5]],
+                "bid_sizes": [[1.0, 2.0]],
+                "ask_prices": [[101.0, 101.5]],
+                "ask_sizes": [[1.0, 2.0]],
+            }
+        )
+    )
+    full_fill_at_ns = decision_at_ns + NS_PER_SECOND
+    horizon_end_ns = full_fill_at_ns + 15 * 60 * NS_PER_SECOND
+    trades = _TradeSeries(
+        pa.table(
+            {
+                "received_at_ns": [
+                    full_fill_at_ns,
+                    full_fill_at_ns + NS_PER_SECOND,
+                    horizon_end_ns,
+                ],
+                "event_ts_ms": [
+                    BASE_TS_MS + 1_000,
+                    BASE_TS_MS + 2_000,
+                    BASE_TS_MS + 901_000,
+                ],
+                "sequence": [1, 2, 3],
+                "side": ["Sell", "Buy", "Buy"],
+                "price": [100.0, 102.0, 100.0],
+                "size": [1.5, 1.0, 1.0],
+            }
+        )
+    )
+    feature: dict[str, object] = {
+        "decision_id": "decision-1",
+        "decision_at_ns": decision_at_ns,
+        "decision_utc_date": "2027-01-15",
+        "best_bid_price": 100.0,
+        "best_ask_price": 101.0,
+        "realized_volatility_60m_fraction": 0.001,
+    }
+
+    labels = _execution_label_rows(
+        source_dataset_id="source-1",
+        symbol="BTCUSDT",
+        feature=feature,
+        books=books,
+        trades=trades,
+        parameters=ExecutionResearchParameters(
+            position_horizons_minutes=(15,),
+            order_notionals_usdt=(50.0,),
+            submission_latency_ms=0,
+            activation_max_delay_ms=500,
+            entry_ttl_seconds=30,
+        ),
+        quality=Counter(),
+    )
+
+    long_label = next(row for row in labels if row["side"] == "LONG")
+    assert long_label["fill_status"] == "FULL_FILL"
+    assert long_label["full_fill_at_ns"] == full_fill_at_ns
+    assert long_label["outcome"] == "TP_FIRST"
+    assert long_label["hit_at_ns"] == full_fill_at_ns + NS_PER_SECOND
+
+
+def test_builds_immutable_execution_research_dataset(tmp_path: Path) -> None:
+    canonical = canonical_fixture(tmp_path)
+    output_root = tmp_path / "execution-research"
+    parameters = ExecutionResearchParameters(
+        position_horizons_minutes=(15,),
+        order_notionals_usdt=(50.0,),
+        submission_latency_ms=0,
+        activation_max_delay_ms=60_000,
+        entry_ttl_seconds=65,
+    )
+    first = build_execution_research_dataset(
+        canonical,
+        output_root,
+        parameters=parameters,
+    )
+
+    assert first.reused is False
+    assert first.feature_rows > 0
+    assert first.execution_label_rows > 0
+    assert first.output_files == 2
+    features = _read_output(first.dataset_path, "features").to_pylist()
+    labels = _read_output(first.dataset_path, "execution_labels").to_pylist()
+    assert features
+    assert labels
+    assert {row["horizon_minutes"] for row in labels} == {15}
+    assert {row["order_notional_usdt"] for row in labels} == {50.0}
+    assert {row["fill_status"] for row in labels} <= {
+        "NO_FILL",
+        "PARTIAL_FILL",
+        "FULL_FILL",
+    }
+    for row in labels:
+        assert row["decision_at_ns"] < row["activation_at_ns"]
+        assert 0.0 <= row["fill_fraction"] <= 1.0
+        if row["fill_status"] == "FULL_FILL":
+            assert row["full_fill_at_ns"] is not None
+            assert row["outcome"] in {
+                "TP_FIRST",
+                "SL_FIRST",
+                "TIMEOUT",
+                "AMBIGUOUS",
+            }
+
+    manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["research_profile"] == "execution_microstructure_v1"
+    assert manifest["scope"]["maker_fill_is_proxy"] is True
+    assert manifest["scope"]["eligible_for_profitability_conclusion"] is False
+    assert manifest["processing"] == {
+        "maximum_source_partitions_loaded_per_symbol": 3,
+        "mode": "utc_day_with_adjacent_context",
+        "output_partition_count": 1,
+    }
+    assert manifest["output_rows"]["execution_labels"] == len(labels)
+
+    second = build_execution_research_dataset(
+        canonical,
+        output_root,
+        parameters=parameters,
+    )
+    assert second.reused is True
+    assert second.output_fingerprint == first.output_fingerprint
+
+
+def test_build_execution_research_cli_prints_summary(
+    config_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    canonical = canonical_fixture(tmp_path)
+    output_root = tmp_path / "execution-cli"
+    monkeypatch.setenv("TRADINGBOT_MIN_FREE_BYTES", "1")
+
+    main(
+        [
+            "--config",
+            str(config_path),
+            "build-execution-research",
+            "--dataset",
+            str(canonical),
+            "--output-root",
+            str(output_root),
+            "--horizon-minutes",
+            "15",
+            "--order-notional-usdt",
+            "50",
+            "--submission-latency-ms",
+            "0",
+            "--activation-max-delay-ms",
+            "60000",
+            "--entry-ttl-seconds",
+            "65",
+        ]
+    )
+
+    summary: dict[str, Any] = json.loads(capsys.readouterr().out)
+    assert summary["execution_research_schema_version"] == 1
+    assert summary["research_profile"] == "execution_microstructure_v1"
+    assert summary["feature_rows"] > 0
+    assert summary["execution_label_rows"] > 0
     assert summary["reused"] is False

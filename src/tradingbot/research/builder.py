@@ -677,6 +677,18 @@ class _TradeSeries:
         ):
             raise ResearchBuildError("trades contain invalid price or size")
 
+        execution_eligible = np.ones(table.num_rows, dtype=np.bool_)
+        for field_name in ("is_block_trade", "is_rpi_trade"):
+            if field_name not in table.schema.names:
+                continue
+            flags = table.column(field_name).combine_chunks()
+            if flags.null_count:
+                flags = pc.fill_null(flags, pa.scalar(False, type=pa.bool_()))
+            flag_values = np.asarray(
+                flags.to_numpy(zero_copy_only=False), dtype=np.bool_
+            )
+            execution_eligible &= ~flag_values
+
         order = np.lexsort((sequence, event_ts_ms, received))
         self.received_at_ns = received[order]
         self.event_ts_ms = event_ts_ms[order]
@@ -684,6 +696,7 @@ class _TradeSeries:
         self.price = price[order]
         self.size = size[order]
         self.is_buy = is_buy[order]
+        self.is_visible_execution_trade = execution_eligible[order]
 
         notional = self.price * self.size
         signed_size = np.where(self.is_buy, self.size, -self.size)
@@ -782,23 +795,59 @@ class _TradeSeries:
         take_profit_price: float,
         stop_distance_bps: float,
         take_profit_distance_bps: float,
+        start_after_index: int | None = None,
+        execution_eligible_only: bool = False,
     ) -> _BarrierResult | None:
         if self.last_received_at_ns < label_end_ns:
             return None
-        start = int(
-            np.searchsorted(self.received_at_ns, decision_at_ns, side="right")
-        )
+        if start_after_index is None:
+            start = int(
+                np.searchsorted(
+                    self.received_at_ns, decision_at_ns, side="right"
+                )
+            )
+        else:
+            if not 0 <= start_after_index < len(self.received_at_ns):
+                raise ResearchBuildError("start_after_index is outside the trade series")
+            if int(self.received_at_ns[start_after_index]) < decision_at_ns:
+                raise ResearchBuildError(
+                    "start_after_index precedes the barrier start timestamp"
+                )
+            start = max(
+                int(
+                    np.searchsorted(
+                        self.received_at_ns, decision_at_ns, side="left"
+                    )
+                ),
+                start_after_index + 1,
+            )
         end = int(
             np.searchsorted(self.received_at_ns, label_end_ns, side="right")
         )
-        future_count = end - start
+        if execution_eligible_only:
+            eligible_offsets = np.flatnonzero(
+                self.is_visible_execution_trade[start:end]
+            )
+            future_count = len(eligible_offsets)
+            timeout_index = (
+                None
+                if future_count == 0
+                else start + int(eligible_offsets[-1])
+            )
+        else:
+            future_count = end - start
+            timeout_index = None if future_count == 0 else end - 1
         if future_count <= 0:
             return _BarrierResult(
                 outcome="TIMEOUT",
                 hit_index=None,
                 timeout_price=None,
                 outcome_return_bps=None,
-                resolution="no_public_trade_in_complete_horizon",
+                resolution=(
+                    "no_eligible_public_trade_in_complete_horizon"
+                    if execution_eligible_only
+                    else "no_public_trade_in_complete_horizon"
+                ),
                 future_trade_count=0,
             )
 
@@ -827,12 +876,21 @@ class _TradeSeries:
             if raw_start >= raw_end:
                 continue
             prices = self.price[raw_start:raw_end]
+            eligible = (
+                self.is_visible_execution_trade[raw_start:raw_end]
+                if execution_eligible_only
+                else np.ones(raw_end - raw_start, dtype=np.bool_)
+            )
             if side == "LONG":
-                tp_hits = np.flatnonzero(prices >= take_profit_price)
-                sl_hits = np.flatnonzero(prices <= stop_price)
+                tp_hits = np.flatnonzero(
+                    (prices >= take_profit_price) & eligible
+                )
+                sl_hits = np.flatnonzero((prices <= stop_price) & eligible)
             else:
-                tp_hits = np.flatnonzero(prices <= take_profit_price)
-                sl_hits = np.flatnonzero(prices >= stop_price)
+                tp_hits = np.flatnonzero(
+                    (prices <= take_profit_price) & eligible
+                )
+                sl_hits = np.flatnonzero((prices >= stop_price) & eligible)
             tp_index = (
                 None if len(tp_hits) == 0 else raw_start + int(tp_hits[0])
             )
@@ -876,7 +934,9 @@ class _TradeSeries:
                 future_trade_count=future_count,
             )
 
-        timeout_price = float(self.price[end - 1])
+        if timeout_index is None:
+            raise ResearchBuildError("timeout trade index is unexpectedly missing")
+        timeout_price = float(self.price[timeout_index])
         direction = 1.0 if side == "LONG" else -1.0
         timeout_return_bps = direction * (timeout_price / entry_price - 1) * 10_000
         return _BarrierResult(
@@ -937,6 +997,8 @@ def _load_symbol_series(
                 "side",
                 "price",
                 "size",
+                "is_block_trade",
+                "is_rpi_trade",
             ],
         )
     )

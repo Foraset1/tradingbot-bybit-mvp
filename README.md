@@ -1,9 +1,9 @@
 # TradingBot — Bybit futures research foundation
 
 Безопасная read-only основа проекта: сборщик публичных рыночных данных Bybit,
-канонический Parquet-слой, воспроизводимый набор causal features/market labels и offline
-оценка локальной модели. Эта версия **не принимает live-решений, не запрашивает API-ключи
-и не умеет отправлять ордера**.
+канонический Parquet-слой, воспроизводимые causal features/market labels,
+execution-aware proxy labels и offline-оценка локальной модели. Эта версия **не принимает
+live-решений, не запрашивает API-ключи и не умеет отправлять ордера**.
 
 Поддерживаемые USDT perpetual пары:
 
@@ -58,6 +58,11 @@
 - минутная UTC decision grid с проверкой `received_at_ns <= decision_at_ns`;
 - признаки цены, волатильности, стакана, order flow, OI/funding и режима BTC;
 - отдельные triple-barrier labels 5/15/30/60 минут без ложного `maker fill`;
+- отдельный профиль `execution_microstructure_v1` с `PostOnly` activation check,
+  консервативной видимой очередью и классами `NO_FILL/PARTIAL_FILL/FULL_FILL`;
+- post-fill TP/SL/TIMEOUT labels для горизонтов 15/30 минут и номиналов
+  50/100/250/500 USDT;
+- посуточная execution-сборка с максимум тремя UTC-разделами одного символа в памяти;
 - атомарный versioned research dataset с проверяемыми fingerprint и provenance;
 - purged walk-forward split с 60-минутным embargo и явным режимом короткого smoke-test;
 - class-prior и ограниченный равномерной по времени выборкой logistic baseline, а также
@@ -95,6 +100,8 @@ Bootstrap бесплатной официальной истории сдело�
 [`docs/HISTORICAL_BOOTSTRAP.md`](docs/HISTORICAL_BOOTSTRAP.md).
 Контракт causal features и market labels описан в
 [`docs/FEATURES_AND_LABELS.md`](docs/FEATURES_AND_LABELS.md).
+Консервативная модель maker fill V3 и команды её запуска описаны в
+[`docs/EXECUTION_RESEARCH.md`](docs/EXECUTION_RESEARCH.md).
 Запуск baseline, LightGBM и cost-aware backtest описан в
 [`docs/RESEARCH_BACKTEST.md`](docs/RESEARCH_BACKTEST.md).
 Пошаговое production-развёртывание на Ubuntu Server 24.04 описано в
@@ -136,7 +143,7 @@ Offline evaluation также поддерживает физический уз
 2,71 GB/сутки до учёта рыночного режима. На диске 100 GB целевое окно raw — 7 дней;
 завершённые UTC-дни сохраняются в существенно меньшем Parquet-архиве. Disk guard оставляет
 минимум 15 GiB свободного места и останавливает сбор вместо заполнения файловой системы.
-Версия 0.6.0 строит только проверяемый dry-run очистки и ещё не удаляет файлы.
+Текущая реализация строит только проверяемый dry-run очистки и ещё не удаляет файлы.
 
 Официальные суточные trade archives можно потоково преобразовать в отдельный компактный
 профиль `price_futures_v1` без хранения gzip и отдельных тиков:
@@ -233,6 +240,18 @@ tradingbot build-research \
   --output-root data/research
 ```
 
+Отдельный V3 dataset для консервативной оценки `PostOnly` и maker queue строится из того
+же live-каталога:
+
+```bash
+tradingbot build-execution-research \
+  --catalog data/archive/catalog.json \
+  --output-root data/execution-research
+```
+
+Официальный price-only архив не подходит для этой команды, потому что не содержит
+локальных L50 snapshots и `received_at_ns`.
+
 Техническая offline-оценка строится из неизменяемого research dataset:
 
 ```bash
@@ -250,11 +269,11 @@ tradingbot run-backtest \
 по символам, ablation календарных признаков и diagnostics selection bias. История короче
 44 дней запускает только технический 70/30 smoke-test; следующий зафиксированный model review
 требует 365 завершённых UTC дней и минимум трёх временных folds.
-Даже тогда нельзя делать вывод о реальной доходности до отдельного maker execution simulator.
-Текущих секундных L50 snapshots и public trades достаточно для первой модели движения на
-5–60 минут, но недостаточно для точного положения maker-ордера в очереди. `NO_FILL` и
-partial fills будут отдельным этапом simulator с более детальными изменениями стакана и
-калибровкой по demo fills.
+Даже тогда нельзя делать вывод о реальной доходности. V3 уже строит консервативные proxy
+labels `NO_FILL/PARTIAL_FILL/FULL_FILL` из секундных L50 snapshots и public trades, но не
+наблюдает реальный order acknowledgement, точное место ордера, hidden liquidity и все
+отмены внутри очереди. Следующие gates — fill-модель, execution-aware backtest и калибровка
+proxy по demo fills. Только после них возможен paper/testnet этап.
 
 Это исследовательское ПО, а не финансовая рекомендация. Даже хорошо протестированная
 модель может потерять деньги из-за смены режима рынка, ошибок исполнения или сбоя биржи.

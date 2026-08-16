@@ -134,7 +134,7 @@ jq '{mode,delete_before_date,candidate_file_count,candidate_bytes,blocker_count,
 Пока кандидатов нет (сбор идёт меньше семи дней), `safe_to_apply` будет `false`, но при
 `blocker_count: 0` это нормальный результат: удалять просто нечего.
 
-В версии 0.5.0 намеренно отсутствует флаг `--apply`. Сначала нужны 2–3 успешных суточных
+Флаг `--apply` намеренно отсутствует. Сначала нужны 2–3 успешных суточных
 архива и сохранённые dry-run отчёты. После их аудита добавляется отдельное подтверждаемое
 удаление и systemd timer; до этого raw остаётся нетронутым.
 
@@ -152,5 +152,21 @@ sudo chown foraset1:foraset1 "$REPORT_DIR/research-build-result-catalog.json"
 ```
 
 Research builder полностью проверяет каждый дневной dataset и принимает только
-последовательные UTC-даты с одинаковым набором символов. Для окончательной оценки модели
-V2 зафиксирован порог не менее 365 дней; более короткий результат не проходит model-review gate.
+последовательные UTC-даты с одинаковым набором символов.
+
+Тот же каталог является источником execution-aware V3, но эта команда использует только
+live orderbook/trades, а не официальный price-only history catalog:
+
+```bash
+sudo docker compose run --rm --no-deps collector \
+  python -m tradingbot build-execution-research \
+  --catalog /data/archive/catalog.json \
+  --output-root /data/execution-research \
+  > "$REPORT_DIR/execution-v3-build-result.json" \
+  2> "$REPORT_DIR/execution-v3.log"
+sudo chown foraset1:foraset1 \
+  "$REPORT_DIR/execution-v3-build-result.json" "$REPORT_DIR/execution-v3.log"
+```
+
+V3 обрабатывает каталог посуточно с соседними UTC-разделами и подробно описан в
+[`EXECUTION_RESEARCH.md`](EXECUTION_RESEARCH.md).
