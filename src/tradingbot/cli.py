@@ -229,7 +229,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     archive = subparsers.add_parser(
         "archive-day",
-        help="Strictly audit and archive one completed UTC day as immutable Parquet",
+        help=(
+            "Audit and archive one completed UTC day as immutable Parquet; "
+            "preserve explicitly marked kline gaps"
+        ),
     )
     archive.add_argument(
         "--date",
@@ -792,7 +795,11 @@ def _run_archive_day(
     output: Path | None,
 ) -> None:
     try:
-        from tradingbot.data.archive import ArchiveError, archive_day
+        from tradingbot.data.archive import (
+            ARCHIVE_DAY_SCHEMA_VERSION,
+            ArchiveError,
+            archive_day,
+        )
     except ModuleNotFoundError as exc:
         if exc.name == "pyarrow" or (exc.name or "").startswith("pyarrow."):
             LOGGER.error(
@@ -824,6 +831,17 @@ def _run_archive_day(
         )
     except (ArchiveError, ValueError) as exc:
         LOGGER.error("Daily archive rejected: %s", exc)
+        payload: dict[str, object] = {
+            "archive_day_schema_version": ARCHIVE_DAY_SCHEMA_VERSION,
+            "ok": False,
+            "partition_date": selected_date,
+            "error": str(exc),
+        }
+        if isinstance(exc, ArchiveError):
+            payload.update(exc.details)
+        if output is not None:
+            write_health(output.expanduser().resolve(), payload)
+        print(json.dumps(payload, indent=2, sort_keys=True))
         raise SystemExit(1) from exc
     payload = result.to_dict()
     if output is not None:

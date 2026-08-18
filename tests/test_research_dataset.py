@@ -26,6 +26,7 @@ from tradingbot.data.canonical import (
 )
 from tradingbot.research.builder import (
     NS_PER_SECOND,
+    _KlineSeries,
     _OrderBookSeries,
     _TradeSeries,
     build_research_dataset,
@@ -36,6 +37,7 @@ from tradingbot.research.contracts import (
 )
 from tradingbot.research.execution_builder import (
     _activation_snapshot,
+    _ContinuityGuard,
     _execution_label_rows,
     _maker_fill,
     _maker_fills,
@@ -443,6 +445,122 @@ def test_execution_parameters_reject_optimistic_or_unbounded_assumptions() -> No
             activation_max_delay_ms=2_500,
             entry_ttl_seconds=3,
         ).validate()
+    with pytest.raises(ResearchBuildError, match="at most 120000"):
+        replace(defaults, maximum_continuity_gap_ms=120_001).validate()
+
+
+def test_continuity_guard_rejects_session_boundaries_and_large_book_gaps() -> None:
+    base_ns = BASE_TS_MS * 1_000_000
+    second_ns = NS_PER_SECOND
+    common_books = {
+        "bid_prices": [[100.0]] * 4,
+        "bid_sizes": [[1.0]] * 4,
+        "ask_prices": [[101.0]] * 4,
+        "ask_sizes": [[1.0]] * 4,
+    }
+    books = _OrderBookSeries(
+        pa.table(
+            {
+                "received_at_ns": [
+                    base_ns,
+                    base_ns + 30 * second_ns,
+                    base_ns + 60 * second_ns,
+                    base_ns + 90 * second_ns,
+                ],
+                "session_id": [
+                    "session-a",
+                    "session-a",
+                    "session-b",
+                    "session-b",
+                ],
+                **common_books,
+            }
+        )
+    )
+
+    assert books.has_continuous_coverage(
+        base_ns + 5 * second_ns,
+        base_ns + 25 * second_ns,
+        45_000,
+    )
+    assert not books.has_continuous_coverage(
+        base_ns + 5 * second_ns,
+        base_ns + 65 * second_ns,
+        45_000,
+    )
+
+    sparse_books = _OrderBookSeries(
+        pa.table(
+            {
+                "received_at_ns": [base_ns, base_ns + 50 * second_ns],
+                "session_id": ["session-a", "session-a"],
+                "bid_prices": [[100.0], [100.0]],
+                "bid_sizes": [[1.0], [1.0]],
+                "ask_prices": [[101.0], [101.0]],
+                "ask_sizes": [[1.0], [1.0]],
+            }
+        )
+    )
+    assert not sparse_books.has_continuous_coverage(
+        base_ns,
+        base_ns + 50 * second_ns,
+        45_000,
+    )
+
+
+def test_continuity_guard_requires_every_intersecting_one_minute_candle() -> None:
+    base_ns = BASE_TS_MS * 1_000_000
+    second_ns = NS_PER_SECOND
+    complete = _KlineSeries(
+        pa.table(
+            {
+                "interval": ["1", "1", "1"],
+                "start_ms": [
+                    BASE_TS_MS,
+                    BASE_TS_MS + MINUTE_MS,
+                    BASE_TS_MS + 2 * MINUTE_MS,
+                ],
+            }
+        )
+    )
+    gapped = _KlineSeries(
+        pa.table(
+            {
+                "interval": ["1", "1"],
+                "start_ms": [BASE_TS_MS, BASE_TS_MS + 2 * MINUTE_MS],
+            }
+        )
+    )
+    books = _OrderBookSeries(
+        pa.table(
+            {
+                "received_at_ns": [
+                    base_ns,
+                    base_ns + 60 * second_ns,
+                    base_ns + 120 * second_ns,
+                    base_ns + 180 * second_ns,
+                ],
+                "session_id": ["session-a"] * 4,
+                "bid_prices": [[100.0]] * 4,
+                "bid_sizes": [[1.0]] * 4,
+                "ask_prices": [[101.0]] * 4,
+                "ask_sizes": [[1.0]] * 4,
+            }
+        )
+    )
+    complete_guard = _ContinuityGuard(books, complete, 90_000)
+    gapped_guard = _ContinuityGuard(books, gapped, 90_000)
+
+    assert complete.has_complete_coverage(
+        base_ns,
+        base_ns + 3 * 60 * second_ns,
+    )
+    assert complete_guard.covers(base_ns, base_ns + 3 * 60 * second_ns)
+    assert not gapped.has_complete_coverage(
+        base_ns,
+        base_ns + 3 * 60 * second_ns,
+    )
+    assert not gapped_guard.covers(base_ns, base_ns + 3 * 60 * second_ns)
 
 
 def test_activation_snapshot_uses_observed_queue_and_post_only_guard() -> None:
@@ -839,7 +957,13 @@ def test_builds_immutable_execution_research_dataset(tmp_path: Path) -> None:
 
     manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
     assert manifest["research_profile"] == "execution_microstructure_v1"
+    assert manifest["source"]["gapped_partition_dates"] == []
+    assert manifest["parameters"]["maximum_continuity_gap_ms"] == 90_000
+    assert "one observed WebSocket session" in manifest["causality"][
+        "continuity_rule"
+    ]
     assert manifest["scope"]["maker_fill_is_proxy"] is True
+    assert manifest["scope"]["gapped_source_supported_with_window_filter"] is True
     assert manifest["scope"]["eligible_for_profitability_conclusion"] is False
     assert manifest["processing"] == {
         "maximum_source_partitions_loaded_per_symbol": 3,

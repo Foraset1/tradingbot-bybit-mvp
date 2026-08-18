@@ -79,6 +79,7 @@ class _CanonicalSource:
     symbols: tuple[str, ...]
     files: tuple[_CanonicalFile, ...]
     total_bytes: int
+    gapped_dates: tuple[str, ...]
 
     def paths(self, kind: str, symbol: str) -> tuple[Path, ...]:
         selected = tuple(
@@ -173,7 +174,11 @@ def _load_json(path: Path, label: str) -> dict[str, Any]:
     return _json_object(parsed, label)
 
 
-def _load_canonical_source(dataset_path: str | Path) -> _CanonicalSource:
+def _load_canonical_source(
+    dataset_path: str | Path,
+    *,
+    allow_gapped: bool = False,
+) -> _CanonicalSource:
     try:
         validated = validate_canonical_dataset(dataset_path)
     except DatasetBuildError as exc:
@@ -245,6 +250,22 @@ def _load_canonical_source(dataset_path: str | Path) -> _CanonicalSource:
                 f"{', '.join(sorted(missing))}"
             )
 
+    raw_quality = raw_source.get("archive_quality")
+    gapped_dates: tuple[str, ...] = ()
+    if raw_quality is not None:
+        quality = _json_object(
+            raw_quality, "canonical manifest.source.archive_quality"
+        )
+        status = quality.get("status")
+        if status not in {"clean", "gapped"}:
+            raise ResearchBuildError("canonical archive quality status is invalid")
+        if status == "gapped":
+            gapped_dates = tuple(sorted({item.date for item in files}))
+            if not allow_gapped:
+                raise ResearchBuildError(
+                    "gapped canonical data requires a continuity-aware research builder"
+                )
+
     return _CanonicalSource(
         dataset_id=validated.dataset_id,
         root=root,
@@ -254,10 +275,15 @@ def _load_canonical_source(dataset_path: str | Path) -> _CanonicalSource:
         symbols=tuple(sorted(symbols)),
         files=tuple(sorted(files, key=lambda item: item.path)),
         total_bytes=total_bytes,
+        gapped_dates=gapped_dates,
     )
 
 
-def _load_archive_catalog_source(catalog_path: str | Path) -> _CanonicalSource:
+def _load_archive_catalog_source(
+    catalog_path: str | Path,
+    *,
+    allow_gapped: bool = False,
+) -> _CanonicalSource:
     from tradingbot.data.archive import ArchiveError, load_archive_catalog
 
     try:
@@ -278,7 +304,11 @@ def _load_archive_catalog_source(catalog_path: str | Path) -> _CanonicalSource:
 
     archive_root = catalog.path.parent.resolve()
     daily_sources = tuple(
-        _load_canonical_source(day.canonical_dataset_path) for day in catalog.entries
+        _load_canonical_source(
+            day.canonical_dataset_path,
+            allow_gapped=allow_gapped,
+        )
+        for day in catalog.entries
     )
     symbols = daily_sources[0].symbols
     combined_files: list[_CanonicalFile] = []
@@ -317,6 +347,15 @@ def _load_archive_catalog_source(catalog_path: str | Path) -> _CanonicalSource:
         symbols=symbols,
         files=tuple(sorted(combined_files, key=lambda item: item.path)),
         total_bytes=sum(item.bytes for item in combined_files),
+        gapped_dates=tuple(
+            sorted(
+                {
+                    partition
+                    for source in daily_sources
+                    for partition in source.gapped_dates
+                }
+            )
+        ),
     )
 
 
@@ -372,6 +411,16 @@ class _OrderBookSeries:
         self.table = table
         self.received_at_ns = received[order]
         self.original_indices = order
+        if "session_id" in table.schema.names:
+            raw_sessions = table.column("session_id").combine_chunks().to_pylist()
+            self.session_ids = tuple(
+                "<legacy>"
+                if raw_sessions[int(index)] is None
+                else str(raw_sessions[int(index)])
+                for index in order
+            )
+        else:
+            self.session_ids = tuple("<legacy>" for _ in order)
 
     @property
     def first_received_at_ns(self) -> int:
@@ -380,6 +429,40 @@ class _OrderBookSeries:
     @property
     def last_received_at_ns(self) -> int:
         return int(self.received_at_ns[-1])
+
+    def has_continuous_coverage(
+        self,
+        start_ns: int,
+        end_ns: int,
+        maximum_gap_ms: int,
+    ) -> bool:
+        """Prove one WebSocket session covers the complete closed interval."""
+
+        if end_ns < start_ns or maximum_gap_ms <= 0:
+            return False
+        left = int(
+            np.searchsorted(self.received_at_ns, start_ns, side="right")
+        ) - 1
+        right = int(
+            np.searchsorted(self.received_at_ns, end_ns, side="right")
+        ) - 1
+        if left < 0 or right < left:
+            return False
+        maximum_gap_ns = maximum_gap_ms * NS_PER_MILLISECOND
+        if (
+            start_ns - int(self.received_at_ns[left]) > maximum_gap_ns
+            or end_ns - int(self.received_at_ns[right]) > maximum_gap_ns
+        ):
+            return False
+        observed = self.received_at_ns[left : right + 1]
+        if len(observed) > 1 and bool(
+            np.any(np.diff(observed) > maximum_gap_ns)
+        ):
+            return False
+        session = self.session_ids[left]
+        return all(
+            value == session for value in self.session_ids[left : right + 1]
+        )
 
     def features_at(
         self, decision_at_ns: int, maximum_age_ms: int
@@ -557,6 +640,30 @@ class _KlineSeries:
                     f"canonical kline table contains duplicate start_ms {start_ms}"
                 )
             self.rows_by_start[start_ms] = row
+        self.sorted_starts_ms = np.asarray(
+            sorted(self.rows_by_start), dtype=np.int64
+        )
+
+    def has_complete_coverage(self, start_ns: int, end_ns: int) -> bool:
+        """Return whether every one-minute candle intersecting a window exists."""
+
+        if end_ns < start_ns:
+            return False
+        start_ms = start_ns // NS_PER_MILLISECOND
+        end_ms = end_ns // NS_PER_MILLISECOND
+        first = start_ms // MS_PER_MINUTE * MS_PER_MINUTE
+        last = max(start_ms, end_ms - 1) // MS_PER_MINUTE * MS_PER_MINUTE
+        left = int(np.searchsorted(self.sorted_starts_ms, first, side="left"))
+        right = int(np.searchsorted(self.sorted_starts_ms, last, side="right"))
+        expected = (last - first) // MS_PER_MINUTE + 1
+        if right - left != expected:
+            return False
+        selected = self.sorted_starts_ms[left:right]
+        return bool(
+            len(selected) == expected
+            and int(selected[0]) == first
+            and int(selected[-1]) == last
+        )
 
     def features_at(
         self, decision_at_ns: int, history_minutes: int
@@ -955,7 +1062,14 @@ def _load_symbol_series(
     orderbook = _OrderBookSeries(
         _read_parquet_files(
             source.paths("orderbook", symbol),
-            ["received_at_ns", "bid_prices", "bid_sizes", "ask_prices", "ask_sizes"],
+            [
+                "session_id",
+                "received_at_ns",
+                "bid_prices",
+                "bid_sizes",
+                "ask_prices",
+                "ask_sizes",
+            ],
         )
     )
     ticker = _TickerSeries(

@@ -33,6 +33,12 @@ Collector при этом продолжает работать: архиват�
 повторной проверки audit manifest, canonical manifest, размеров, строк и SHA-256 всех
 Parquet-файлов.
 
+Архивирование и пригодность конкретного временного окна для обучения теперь разделены.
+Строгий audit по-прежнему фиксирует все разрывы. Если единственные предупреждения дня —
+`kline_gap`, день сохраняется без синтетического восстановления данных и получает
+`quality.status: gapped`. Ошибки схемы, отсутствующие потоки, `.partial`, недостаточная
+длительность и любые другие warning-коды по-прежнему блокируют архив.
+
 ## Первый ручной запуск на Ubuntu
 
 Обновить код и образ, не останавливая collector:
@@ -72,9 +78,14 @@ sudo chown foraset1:foraset1 "$REPORT_DIR/archive-day-$DAY.json"
 jq . "$REPORT_DIR/archive-day-$DAY.json"
 ```
 
-Нормальный результат содержит `raw_files > 0`, `canonical_files > 0`, пути внутри
-`/data/archive` и `reused: false`. Повторная команда обязана вернуть те же fingerprint и
-`reused: true`.
+Нормальный результат содержит `ok: true`, `raw_files > 0`, `canonical_files > 0`, пути
+внутри `/data/archive`, блок `quality` и `reused: false`. `quality.status` может быть
+`clean` или `gapped`; второй вариант означает, что V3 исключит небезопасные окна при
+построении dataset. Повторная команда обязана вернуть те же fingerprint и `reused: true`.
+
+При отказе команда также печатает JSON (`ok: false`, `error`, `archive_acceptance`) в
+stdout и записывает тот же payload через `--output`. Поэтому даже неуспешный запуск можно
+передать на аудит без пустого build-файла.
 
 День, в который collector был впервые запущен не с 00:00 UTC, можно принять отдельно с
 явным снижением порога покрытия:
@@ -90,7 +101,8 @@ sudo chown foraset1:foraset1 "$REPORT_DIR/archive-day-$FIRST_DAY.json"
 ```
 
 Это допустимо только для известного неполного первого дня. Для всех следующих дней остаётся
-настроенный порог 82 800 секунд и строгая проверка gap/duplicate/path/schema.
+настроенный порог 82 800 секунд и строгая проверка duplicate/path/schema. Kline gaps
+сохраняются как явный признак качества, но не замалчиваются.
 
 ## Архивирование накопившихся полных дней
 
@@ -98,10 +110,14 @@ sudo chown foraset1:foraset1 "$REPORT_DIR/archive-day-$FIRST_DAY.json"
 
 ```bash
 for DAY in 2026-07-28 2026-07-29 2026-07-30 2026-07-31 2026-08-01; do
+  REPORT="$REPORT_DIR/archive-day-$DAY.json"
   sudo docker compose run --rm --no-deps collector \
     python -m tradingbot archive-day --date "$DAY" \
-    > "$REPORT_DIR/archive-day-$DAY.json" || break
-  sudo chown foraset1:foraset1 "$REPORT_DIR/archive-day-$DAY.json"
+    > "$REPORT"
+  STATUS=$?
+  sudo chown foraset1:foraset1 "$REPORT"
+  jq '{ok,partition_date,reused,quality,error,archive_acceptance}' "$REPORT"
+  [ "$STATUS" -eq 0 ] || break
 done
 ```
 
@@ -151,8 +167,10 @@ sudo docker compose run --rm --no-deps collector \
 sudo chown foraset1:foraset1 "$REPORT_DIR/research-build-result-catalog.json"
 ```
 
-Research builder полностью проверяет каждый дневной dataset и принимает только
-последовательные UTC-даты с одинаковым набором символов.
+Обычный `build-research` полностью проверяет каждый дневной dataset, требует
+последовательные UTC-даты с одинаковым набором символов и намеренно отклоняет каталог с
+`quality.status: gapped`. Этот старый builder не умеет доказать непрерывность каждого
+feature/label-окна.
 
 Тот же каталог является источником execution-aware V3, но эта команда использует только
 live orderbook/trades, а не официальный price-only history catalog:
@@ -170,3 +188,8 @@ sudo chown foraset1:foraset1 \
 
 V3 обрабатывает каталог посуточно с соседними UTC-разделами и подробно описан в
 [`EXECUTION_RESEARCH.md`](EXECUTION_RESEARCH.md).
+
+Именно V3 разрешено передавать каталог с gapped-днями. Он не заполняет пропуски, а удаляет
+только решения и labels, чьи feature, maker-entry или post-fill окна пересекают разрыв,
+смену WebSocket-сессии либо отсутствующую минутную свечу. Список таких исходных дней
+записывается в `source.gapped_partition_dates` manifest.

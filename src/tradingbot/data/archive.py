@@ -30,6 +30,7 @@ from tradingbot.data.canonical import (
     load_audit_input_manifest,
     validate_canonical_dataset,
 )
+from tradingbot.data.quality import attach_archive_acceptance
 
 ARCHIVE_DAY_SCHEMA_VERSION: Final = 1
 ARCHIVE_CATALOG_SCHEMA_VERSION: Final = 1
@@ -38,6 +39,15 @@ RETENTION_PLAN_SCHEMA_VERSION: Final = 1
 
 class ArchiveError(RuntimeError):
     """Raised when an archive or retention safety invariant is violated."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        details: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.details = {} if details is None else details
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +61,11 @@ class ArchiveDay:
     raw_files: int
     raw_records: int
     raw_bytes: int
+    quality_policy: str | None
+    quality_status: str
+    warning_codes: tuple[str, ...]
+    warning_items: int
+    warning_occurrences: int
     canonical_dataset_path: Path
     canonical_manifest_path: Path
     canonical_manifest_sha256: str
@@ -73,6 +88,11 @@ class ArchiveDayResult:
     raw_files: int
     raw_records: int
     raw_bytes: int
+    quality_policy: str
+    quality_status: str
+    warning_codes: tuple[str, ...]
+    warning_items: int
+    warning_occurrences: int
     canonical_files: int
     canonical_rows: int
     canonical_bytes: int
@@ -81,6 +101,7 @@ class ArchiveDayResult:
     def to_dict(self) -> dict[str, object]:
         return {
             "archive_day_schema_version": ARCHIVE_DAY_SCHEMA_VERSION,
+            "ok": True,
             "partition_date": self.partition_date,
             "day_manifest_path": self.day_manifest_path.as_posix(),
             "day_fingerprint": self.day_fingerprint,
@@ -92,6 +113,16 @@ class ArchiveDayResult:
             "raw_files": self.raw_files,
             "raw_records": self.raw_records,
             "raw_bytes": self.raw_bytes,
+            "quality": {
+                "policy": self.quality_policy,
+                "status": self.quality_status,
+                "warning_codes": list(self.warning_codes),
+                "warning_items": self.warning_items,
+                "warning_occurrences": self.warning_occurrences,
+                "training_requires_continuity_filter": (
+                    self.quality_status == "gapped"
+                ),
+            },
             "canonical_files": self.canonical_files,
             "canonical_rows": self.canonical_rows,
             "canonical_bytes": self.canonical_bytes,
@@ -448,6 +479,7 @@ def _day_manifest_payload(
             "records": audit.total_records,
             "bytes": audit.total_bytes,
         },
+        "quality": audit.archive_quality_dict(),
         "canonical": {
             "dataset_id": canonical.dataset_id,
             "dataset_path": _archive_relative(canonical.dataset_path, archive_root),
@@ -506,6 +538,13 @@ def _validate_day_manifest(
         raise ArchiveError("daily audit policy does not match archive partition")
     if any(not _audit_partition_matches(item.path, partition) for item in audit.files):
         raise ArchiveError("daily audit contains a file from another partition")
+    expected_quality = audit.archive_quality_dict()
+    raw_quality = raw.get("quality")
+    if raw_quality is None:
+        if audit.archive_acceptance_policy is not None:
+            raise ArchiveError("archive day is missing quality metadata")
+    elif raw_quality != expected_quality:
+        raise ArchiveError("archive day quality does not match its source audit")
 
     dataset_path = _resolve_archive_path(
         archive_root, canonical_raw.get("dataset_path"), "canonical.dataset_path"
@@ -571,6 +610,11 @@ def _validate_day_manifest(
         raw_files=len(audit.files),
         raw_records=audit.total_records,
         raw_bytes=audit.total_bytes,
+        quality_policy=audit.archive_acceptance_policy,
+        quality_status=audit.archive_quality_status,
+        warning_codes=audit.archive_warning_codes,
+        warning_items=audit.archive_warning_items,
+        warning_occurrences=audit.archive_warning_occurrences,
         canonical_dataset_path=dataset_path,
         canonical_manifest_path=canonical_manifest_path,
         canonical_manifest_sha256=expected_manifest_sha,
@@ -582,7 +626,7 @@ def _validate_day_manifest(
 
 
 def _catalog_entry(day: ArchiveDay, archive_root: Path) -> dict[str, object]:
-    return {
+    entry: dict[str, object] = {
         "partition_date": day.partition_date,
         "day_manifest_path": _archive_relative(day.day_manifest_path, archive_root),
         "day_manifest_sha256": _sha256_file(day.day_manifest_path),
@@ -605,6 +649,18 @@ def _catalog_entry(day: ArchiveDay, archive_root: Path) -> dict[str, object]:
         "canonical_rows": day.canonical_rows,
         "canonical_bytes": day.canonical_bytes,
     }
+    if day.quality_policy is not None:
+        entry["quality"] = {
+            "policy": day.quality_policy,
+            "status": day.quality_status,
+            "warning_codes": list(day.warning_codes),
+            "warning_items": day.warning_items,
+            "warning_occurrences": day.warning_occurrences,
+            "training_requires_continuity_filter": (
+                day.quality_status == "gapped"
+            ),
+        }
+    return entry
 
 
 def _build_catalog_locked(archive_root: Path) -> CatalogResult:
@@ -771,10 +827,20 @@ def archive_day(
                 scratch_dir=scratch_dir,
                 partition_date=selected,
             )
-            if not report.ok:
-                reasons = ", ".join(report.readiness_reasons) or "unknown"
+            audit_payload = report.to_dict()
+            acceptance = attach_archive_acceptance(audit_payload)
+            if not acceptance.ok:
+                reasons = ", ".join(acceptance.reasons) or "unknown"
                 raise ArchiveError(
-                    f"UTC partition {selected.isoformat()} failed strict audit: {reasons}"
+                    f"UTC partition {selected.isoformat()} failed archive policy: {reasons}",
+                    details={
+                        "partition_date": selected.isoformat(),
+                        "input_fingerprint": report.input_fingerprint,
+                        "file_count": len(report.files),
+                        "archive_acceptance": acceptance.to_dict(),
+                        "errors": [item.to_dict() for item in report.errors],
+                        "warnings": [item.to_dict() for item in report.warnings],
+                    },
                 )
             expected_raw_files = {item.path: item.bytes for item in report.files}
             _assert_raw_partition_stable(raw, selected, expected_raw_files)
@@ -784,7 +850,7 @@ def archive_day(
                 / f"date={selected.isoformat()}"
                 / f"audit-v{AUDIT_REPORT_SCHEMA_VERSION}-{report.input_fingerprint[:16]}.json"
             )
-            _write_immutable_json(audit_path, report.to_dict())
+            _write_immutable_json(audit_path, audit_payload)
             canonical_parent = archive / "canonical" / f"date={selected.isoformat()}"
             try:
                 build = build_canonical_dataset(
@@ -821,6 +887,11 @@ def archive_day(
         raw_files=day.raw_files,
         raw_records=day.raw_records,
         raw_bytes=day.raw_bytes,
+        quality_policy=day.quality_policy or "legacy_strict_v1",
+        quality_status=day.quality_status,
+        warning_codes=day.warning_codes,
+        warning_items=day.warning_items,
+        warning_occurrences=day.warning_occurrences,
         canonical_files=day.canonical_files,
         canonical_rows=day.canonical_rows,
         canonical_bytes=day.canonical_bytes,

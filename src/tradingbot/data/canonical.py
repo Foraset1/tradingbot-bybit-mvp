@@ -35,6 +35,7 @@ import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
 from tradingbot import __version__
 from tradingbot.data.audit import AUDIT_REPORT_SCHEMA_VERSION
+from tradingbot.data.quality import read_archive_acceptance
 
 DATASET_SCHEMA_VERSION: Final = 1
 PARQUET_FORMAT_VERSION: Final = "2.6"
@@ -72,6 +73,28 @@ class AuditInputManifest:
     kline_intervals: tuple[str, ...]
     kline_revisions: int
     duplicate_klines: int
+    archive_acceptance_policy: str | None
+    archive_quality_status: str
+    archive_warning_codes: tuple[str, ...]
+    archive_warning_items: int
+    archive_warning_occurrences: int
+
+    def archive_quality_dict(self) -> dict[str, object]:
+        return {
+            "policy": self.archive_acceptance_policy or "legacy_strict_v1",
+            "status": self.archive_quality_status,
+            "warning_codes": list(self.archive_warning_codes),
+            "warning_items": self.archive_warning_items,
+            "warning_occurrences": self.archive_warning_occurrences,
+            "training_requires_continuity_filter": (
+                self.archive_quality_status == "gapped"
+            ),
+        }
+
+    def stored_archive_quality_dict(self) -> dict[str, object] | None:
+        if self.archive_acceptance_policy is None:
+            return None
+        return self.archive_quality_dict()
 
 
 @dataclass(frozen=True, slots=True)
@@ -380,7 +403,7 @@ def _string_tuple(value: object, label: str) -> tuple[str, ...]:
 
 
 def load_audit_input_manifest(path: str | Path) -> AuditInputManifest:
-    """Load and validate the strict audit report used as the source manifest."""
+    """Load a strict-clean or explicitly continuity-aware audit manifest."""
 
     report_path = Path(path).expanduser().resolve()
     try:
@@ -396,13 +419,13 @@ def load_audit_input_manifest(path: str | Path) -> AuditInputManifest:
         raise DatasetBuildError(
             f"audit report schema must be {AUDIT_REPORT_SCHEMA_VERSION}"
         )
-    readiness = _json_object(report.get("readiness"), "readiness")
-    if readiness.get("ok") is not True or readiness.get("strict") is not True:
-        raise DatasetBuildError("dataset build requires a successful strict audit")
-    if readiness.get("reasons") != []:
-        raise DatasetBuildError("successful audit must not contain readiness reasons")
-    if report.get("errors") != [] or report.get("warnings") != []:
-        raise DatasetBuildError("dataset build requires an audit with no errors or warnings")
+    try:
+        archive_acceptance = read_archive_acceptance(report)
+    except ValueError as exc:
+        raise DatasetBuildError(
+            "dataset build requires a successful strict audit or validated "
+            f"archive acceptance: {exc}"
+        ) from exc
     if (
         report.get("partial_file_count") != 0
         or report.get("partial_files") != []
@@ -481,6 +504,11 @@ def load_audit_input_manifest(path: str | Path) -> AuditInputManifest:
         kline_intervals=intervals,
         kline_revisions=kline_revisions,
         duplicate_klines=duplicate_klines,
+        archive_acceptance_policy=archive_acceptance.policy,
+        archive_quality_status=archive_acceptance.quality_status,
+        archive_warning_codes=archive_acceptance.observed_warning_codes,
+        archive_warning_items=archive_acceptance.warning_items,
+        archive_warning_occurrences=archive_acceptance.warning_occurrences,
     )
 
 
@@ -1080,6 +1108,16 @@ def _validate_existing_dataset(
     source = _json_object(manifest.get("source"), "source")
     if source.get("input_fingerprint") != audit.input_fingerprint:
         raise DatasetBuildError("existing dataset was built from different input")
+    expected_archive_quality = audit.stored_archive_quality_dict()
+    if expected_archive_quality is None:
+        if "archive_quality" in source:
+            raise DatasetBuildError(
+                "legacy strict audit unexpectedly has archive quality metadata"
+            )
+    elif source.get("archive_quality") != expected_archive_quality:
+        raise DatasetBuildError(
+            "canonical archive quality does not match its source audit"
+        )
 
     audit_copy = dataset_path / "source-audit.json"
     stored_audit_sha256 = _valid_sha256(source.get("audit_report_sha256"))
@@ -1290,6 +1328,11 @@ def build_canonical_dataset(
                 "records": audit.total_records,
                 "expected_symbols": list(audit.expected_symbols),
                 "kline_intervals": list(audit.kline_intervals),
+                **(
+                    {}
+                    if audit.stored_archive_quality_dict() is None
+                    else {"archive_quality": audit.stored_archive_quality_dict()}
+                ),
             },
             "canonicalization": {
                 "kline_key": ["symbol", "interval", "start_ms"],
