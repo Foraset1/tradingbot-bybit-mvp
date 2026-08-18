@@ -115,6 +115,7 @@ class ExecutionResearchParameters:
     activation_max_delay_ms: int = 2_500
     entry_ttl_seconds: int = 30
     queue_ahead_multiplier: float = 1.0
+    maximum_continuity_gap_ms: int = 90_000
 
     def feature_parameters(self) -> ResearchParameters:
         return ResearchParameters(
@@ -172,6 +173,16 @@ class ExecutionResearchParameters:
             raise ResearchBuildError(
                 "queue_ahead_multiplier must be finite and at least 1.0"
             )
+        if (
+            isinstance(self.maximum_continuity_gap_ms, bool)
+            or self.maximum_continuity_gap_ms
+            < max(self.max_orderbook_age_ms, self.max_ticker_age_ms)
+            or self.maximum_continuity_gap_ms > 120_000
+        ):
+            raise ResearchBuildError(
+                "maximum_continuity_gap_ms must cover feature freshness and "
+                "must be at most 120000"
+            )
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -191,6 +202,7 @@ class ExecutionResearchParameters:
             "activation_max_delay_ms": self.activation_max_delay_ms,
             "entry_ttl_seconds": self.entry_ttl_seconds,
             "queue_ahead_multiplier": self.queue_ahead_multiplier,
+            "maximum_continuity_gap_ms": self.maximum_continuity_gap_ms,
         }
 
 

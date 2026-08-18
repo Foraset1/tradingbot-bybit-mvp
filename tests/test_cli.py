@@ -7,7 +7,9 @@ from pathlib import Path
 import pytest
 
 from tradingbot.cli import _put_record, main
+from tradingbot.data import archive as archive_module
 from tradingbot.data import bybit_history
+from tradingbot.data.archive import ArchiveError
 from tradingbot.data.bybit_history import HistoryRangeResult
 from tradingbot.market.bybit_public import CollectorStats
 from tradingbot.market.records import MarketRecord
@@ -104,6 +106,49 @@ def test_import_history_command_writes_range_result(
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["days"] == 2
+    assert json.loads(report_path.read_bytes()) == payload
+
+
+def test_archive_day_failure_is_machine_readable_on_stdout_and_disk(
+    config_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    report_path = tmp_path / "reports" / "archive-failure.json"
+
+    def reject_archive(*args: object, **kwargs: object) -> None:
+        raise ArchiveError(
+            "partition failed archive policy",
+            details={
+                "archive_acceptance": {
+                    "ok": False,
+                    "reasons": ["unsupported_warning_codes"],
+                }
+            },
+        )
+
+    monkeypatch.setattr(archive_module, "archive_day", reject_archive)
+    with pytest.raises(SystemExit) as exit_info:
+        main(
+            [
+                "--config",
+                str(config_path),
+                "archive-day",
+                "--date",
+                "2026-07-20",
+                "--output",
+                str(report_path),
+            ]
+        )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_info.value.code == 1
+    assert payload["ok"] is False
+    assert payload["partition_date"] == "2026-07-20"
+    assert payload["archive_acceptance"]["reasons"] == [
+        "unsupported_warning_codes"
+    ]
     assert json.loads(report_path.read_bytes()) == payload
 
 

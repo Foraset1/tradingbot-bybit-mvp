@@ -32,6 +32,7 @@ from tradingbot.research.builder import (
     _CanonicalSource,
     _decision_id,
     _first_grid_at_or_after,
+    _KlineSeries,
     _last_grid_at_or_before,
     _load_archive_catalog_source,
     _load_canonical_source,
@@ -91,6 +92,20 @@ class _MakerFillResult:
     filled_size: float
     first_fill_index: int | None
     full_fill_index: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ContinuityGuard:
+    books: _OrderBookSeries
+    klines: _KlineSeries
+    maximum_gap_ms: int
+
+    def covers(self, start_ns: int, end_ns: int) -> bool:
+        return self.books.has_continuous_coverage(
+            start_ns,
+            end_ns,
+            self.maximum_gap_ms,
+        ) and bool(self.klines.has_complete_coverage(start_ns, end_ns))
 
 
 def _price_tolerance(price: float) -> float:
@@ -378,6 +393,7 @@ def _execution_label_rows(
     trades: _TradeSeries,
     parameters: ExecutionResearchParameters,
     quality: Counter[str],
+    continuity: _ContinuityGuard | None = None,
 ) -> list[dict[str, object]]:
     decision_at_ns = int(cast(int, feature["decision_at_ns"]))
     decision_utc_date = cast(str, feature["decision_utc_date"])
@@ -411,6 +427,14 @@ def _execution_label_rows(
             for order_notional in parameters.order_notionals_usdt
         )
         if activation.post_only_valid:
+            if continuity is not None and not continuity.covers(
+                activation.received_at_ns,
+                entry_window_end_ns,
+            ):
+                quality["entry_scenarios_skipped_discontinuous_window"] += len(
+                    order_sizes
+                )
+                continue
             if activation.queue_ahead_size is None:
                 raise ResearchBuildError(
                     "valid PostOnly activation unexpectedly has no queue size"
@@ -567,6 +591,14 @@ def _execution_label_rows(
                     full_fill_at_ns
                     + horizon_minutes * 60 * NS_PER_SECOND
                 )
+                if continuity is not None and not continuity.covers(
+                    full_fill_at_ns,
+                    position_end_ns,
+                ):
+                    quality[
+                        f"labels_skipped_discontinuous_position_{horizon_minutes}m"
+                    ] += 1
+                    continue
                 if trades.last_received_at_ns < position_end_ns:
                     quality[
                         f"labels_skipped_incomplete_position_{horizon_minutes}m"
@@ -660,6 +692,11 @@ def _build_execution_symbol(
     decision_end_ns: int | None = None,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]], Counter[str]]:
     books, ticker, klines, trades = _load_symbol_series(source, symbol)
+    continuity = _ContinuityGuard(
+        books=books,
+        klines=klines,
+        maximum_gap_ms=parameters.maximum_continuity_gap_ms,
+    )
     interval_ns = parameters.decision_interval_seconds * NS_PER_SECOND
     offset_ns = parameters.decision_offset_seconds * NS_PER_SECOND
     first_available = max(
@@ -705,6 +742,13 @@ def _build_execution_symbol(
     decision_at_ns = first_decision
     while decision_at_ns <= last_decision:
         quality["candidate_decisions"] += 1
+        feature_window_start_ns = decision_at_ns - (
+            parameters.kline_history_minutes + 1
+        ) * 60 * NS_PER_SECOND
+        if not continuity.covers(feature_window_start_ns, decision_at_ns):
+            quality["skipped_discontinuous_feature_window"] += 1
+            decision_at_ns += interval_ns
+            continue
         book_features, reason = books.features_at(
             decision_at_ns, parameters.max_orderbook_age_ms
         )
@@ -753,6 +797,7 @@ def _build_execution_symbol(
                 trades=trades,
                 parameters=parameters,
                 quality=quality,
+                continuity=continuity,
             )
         )
         quality["features_emitted"] += 1
@@ -808,6 +853,9 @@ def _source_window(
         symbols=source.symbols,
         files=files,
         total_bytes=sum(item.bytes for item in files),
+        gapped_dates=tuple(
+            value for value in source.gapped_dates if value in selected_dates
+        ),
     )
 
 
@@ -1237,6 +1285,7 @@ def _build_execution_research(
                 "output_fingerprint": source.output_fingerprint,
                 "symbols": list(source.symbols),
                 "bytes": source.total_bytes,
+                "gapped_partition_dates": list(source.gapped_dates),
                 "partition_dates": [
                     value.isoformat() for value in partition_dates
                 ],
@@ -1273,6 +1322,11 @@ def _build_execution_research(
                     "TP/SL horizon starts only after the full-fill ordering key; "
                     "block and RPI prints cannot resolve a barrier"
                 ),
+                "continuity_rule": (
+                    "feature, maker-entry, and post-fill windows must remain in one "
+                    "observed WebSocket session, stay within the configured maximum "
+                    "orderbook gap, and contain every intersecting one-minute kline"
+                ),
                 "trade_order": [
                     "received_at_ns",
                     "event_ts_ms",
@@ -1288,6 +1342,7 @@ def _build_execution_research(
                 "hidden_liquidity_modeled": False,
                 "block_and_rpi_trades_excluded_from_queue": True,
                 "partial_fills_retained": True,
+                "gapped_source_supported_with_window_filter": True,
                 "eligible_for_fill_model_training": True,
                 "eligible_for_profitability_conclusion": False,
             },
@@ -1335,7 +1390,7 @@ def build_execution_research_dataset(
     """Build execution-aware labels from one canonical dataset."""
 
     return _build_execution_research(
-        _load_canonical_source(canonical_dataset),
+        _load_canonical_source(canonical_dataset, allow_gapped=True),
         output_root,
         parameters=parameters,
         minimum_free_bytes=minimum_free_bytes,
@@ -1352,7 +1407,7 @@ def build_execution_research_dataset_from_catalog(
     """Build execution-aware labels from consecutive immutable archive days."""
 
     return _build_execution_research(
-        _load_archive_catalog_source(archive_catalog),
+        _load_archive_catalog_source(archive_catalog, allow_gapped=True),
         output_root,
         parameters=parameters,
         minimum_free_bytes=minimum_free_bytes,

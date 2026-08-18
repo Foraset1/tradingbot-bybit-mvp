@@ -9,6 +9,7 @@ import pytest
 
 from tradingbot.data.archive import ArchiveError, archive_day, plan_raw_retention
 from tradingbot.research.builder import _load_archive_catalog_source
+from tradingbot.research.contracts import ResearchBuildError
 
 PARTITION = date(2026, 7, 20)
 BASE_TS_MS = int(datetime(2026, 7, 20, 0, 0, tzinfo=UTC).timestamp() * 1_000)
@@ -149,6 +150,25 @@ def _raw_fixture(root: Path) -> None:
     )
 
 
+def _kline_record(start_ms: int) -> dict[str, Any]:
+    return _record(
+        "kline_1",
+        {
+            "start": start_ms,
+            "end": start_ms + 59_999,
+            "interval": "1",
+            "open": "100",
+            "high": "102",
+            "low": "99",
+            "close": "101",
+            "volume": "10",
+            "turnover": "1005",
+            "confirm": True,
+        },
+        exchange_ts_ms=start_ms,
+    )
+
+
 def _build_archive(tmp_path: Path) -> tuple[Path, Path]:
     raw = tmp_path / "raw"
     archive = tmp_path / "archive"
@@ -197,6 +217,100 @@ def test_daily_archive_is_committed_cataloged_and_idempotent(tmp_path: Path) -> 
 
     assert reused.reused
     assert reused.day_fingerprint == first_manifest["day_fingerprint"]
+
+
+def test_daily_archive_preserves_kline_gaps_with_explicit_quality(
+    tmp_path: Path,
+) -> None:
+    raw = tmp_path / "raw"
+    archive = tmp_path / "archive"
+    _raw_fixture(raw)
+    _write_stream(
+        raw,
+        "kline_1",
+        [_kline_record(BASE_TS_MS), _kline_record(BASE_TS_MS + 120_000)],
+    )
+
+    result = archive_day(
+        raw,
+        archive,
+        ["BTCUSDT"],
+        ["1"],
+        partition_date=PARTITION,
+        minimum_duration_seconds=0,
+        minimum_free_bytes=0,
+        scratch_dir=tmp_path / "scratch",
+        today_utc=date(2026, 7, 21),
+    )
+
+    assert result.quality_status == "gapped"
+    assert result.warning_codes == ("kline_gap",)
+    assert result.warning_items == 1
+    assert result.warning_occurrences == 1
+    audit = json.loads(result.audit_path.read_text(encoding="utf-8"))
+    assert audit["readiness"]["ok"] is False
+    assert audit["archive_acceptance"] == {
+        "allowed_warning_codes": ["kline_gap"],
+        "observed_warning_codes": ["kline_gap"],
+        "ok": True,
+        "policy": "continuity_aware_v1",
+        "quality_status": "gapped",
+        "reasons": [],
+        "training_requires_continuity_filter": True,
+        "warning_items": 1,
+        "warning_occurrences": 1,
+    }
+    day = json.loads(result.day_manifest_path.read_text(encoding="utf-8"))
+    catalog = json.loads(result.catalog_path.read_text(encoding="utf-8"))
+    assert day["quality"]["status"] == "gapped"
+    assert catalog["entries"][0]["quality"] == day["quality"]
+
+    with pytest.raises(ResearchBuildError, match="continuity-aware"):
+        _load_archive_catalog_source(result.catalog_path)
+    source = _load_archive_catalog_source(
+        result.catalog_path,
+        allow_gapped=True,
+    )
+    assert source.gapped_dates == ("2026-07-20",)
+
+
+def test_daily_archive_rejects_non_gap_warnings_with_machine_readable_details(
+    tmp_path: Path,
+) -> None:
+    raw = tmp_path / "raw"
+    _raw_fixture(raw)
+    partial = (
+        raw
+        / "ticker"
+        / "BTCUSDT"
+        / "2026"
+        / "07"
+        / "20"
+        / "active.jsonl.partial"
+    )
+    partial.write_text("{}\n", encoding="utf-8", newline="\n")
+
+    with pytest.raises(ArchiveError, match="failed archive policy") as captured:
+        archive_day(
+            raw,
+            tmp_path / "archive",
+            ["BTCUSDT"],
+            ["1"],
+            partition_date=PARTITION,
+            minimum_duration_seconds=0,
+            minimum_free_bytes=0,
+            scratch_dir=tmp_path / "scratch",
+            today_utc=date(2026, 7, 21),
+        )
+
+    details = captured.value.details
+    acceptance = details["archive_acceptance"]
+    assert isinstance(acceptance, dict)
+    assert acceptance["ok"] is False
+    assert set(acceptance["reasons"]) == {
+        "partial_files_present",
+        "unsupported_warning_codes",
+    }
 
 
 def test_archive_rejects_current_day_and_overlapping_roots(tmp_path: Path) -> None:

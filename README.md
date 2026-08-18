@@ -232,7 +232,8 @@ tradingbot build-research \
   --output-root data/research
 ```
 
-Для длительного сбора используется каталог последовательных суточных архивов:
+Для длительного сбора обычный market-label builder использует только каталог
+последовательных суточных архивов со статусом `clean`:
 
 ```bash
 tradingbot build-research \
@@ -251,6 +252,9 @@ tradingbot build-execution-research \
 
 Официальный price-only архив не подходит для этой команды, потому что не содержит
 локальных L50 snapshots и `received_at_ns`.
+V3 может безопасно использовать дни со статусом `gapped`: он не восстанавливает пропуски,
+а исключает feature/entry/post-fill окна, пересекающие kline gap, слишком большой разрыв
+стакана или смену WebSocket-сессии.
 
 Техническая offline-оценка строится из неизменяемого research dataset:
 
@@ -272,8 +276,9 @@ tradingbot run-backtest \
 Даже тогда нельзя делать вывод о реальной доходности. V3 уже строит консервативные proxy
 labels `NO_FILL/PARTIAL_FILL/FULL_FILL` из секундных L50 snapshots и public trades, но не
 наблюдает реальный order acknowledgement, точное место ордера, hidden liquidity и все
-отмены внутри очереди. Следующие gates — fill-модель, execution-aware backtest и калибровка
-proxy по demo fills. Только после них возможен paper/testnet этап.
+отмены внутри очереди. Небезопасные временные окна уже отбрасываются по kline/orderbook
+continuity и `session_id`. Следующие gates — fill-модель, execution-aware backtest и
+калибровка proxy по demo fills. Только после них возможен paper/testnet этап.
 
 Это исследовательское ПО, а не финансовая рекомендация. Даже хорошо протестированная
 модель может потерять деньги из-за смены режима рынка, ошибок исполнения или сбоя биржи.
