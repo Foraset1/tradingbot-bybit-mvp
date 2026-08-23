@@ -7,7 +7,15 @@ from typing import Any
 
 import pytest
 
-from tradingbot.data.archive import ArchiveError, archive_day, plan_raw_retention
+from tradingbot.data import archive as archive_module
+from tradingbot.data.archive import (
+    ArchiveError,
+    RetentionCandidate,
+    apply_raw_retention,
+    archive_day,
+    load_retention_plan,
+    plan_raw_retention,
+)
 from tradingbot.research.builder import _load_archive_catalog_source
 from tradingbot.research.contracts import ResearchBuildError
 
@@ -416,6 +424,220 @@ def test_retention_blocks_all_files_when_canonical_archive_is_corrupt(
     assert len(plan.blockers) == 4
     assert {item.code for item in plan.blockers} == {"archive_not_verified"}
     assert all(path.exists() for path in raw.rglob("*.jsonl"))
+
+
+def _save_retention_plan(path: Path, payload: dict[str, object]) -> None:
+    path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+
+def test_retention_apply_revalidates_and_deletes_only_approved_files(
+    tmp_path: Path,
+) -> None:
+    raw, archive = _build_archive(tmp_path)
+    active = (
+        raw
+        / "ticker"
+        / "BTCUSDT"
+        / "2026"
+        / "07"
+        / "28"
+        / "part-active.jsonl.partial"
+    )
+    active.parent.mkdir(parents=True)
+    active.write_text('{"active":true}\n', encoding="utf-8", newline="\n")
+    plan = plan_raw_retention(
+        raw,
+        archive,
+        retention_days=7,
+        as_of_date="2026-07-28",
+    )
+    plan_path = tmp_path / "approved-plan.json"
+    receipt_path = tmp_path / "reports" / "retention-apply.json"
+    _save_retention_plan(plan_path, plan.to_dict())
+
+    loaded = load_retention_plan(plan_path)
+    assert loaded == plan
+    result = apply_raw_retention(
+        raw,
+        archive,
+        plan_path=plan_path,
+        confirmed_plan_fingerprint=plan.plan_fingerprint,
+        receipt_path=receipt_path,
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "complete"
+    assert result["deletion_performed"] is True
+    assert result["planned_file_count"] == 4
+    assert result["deleted_file_count"] == 4
+    assert result["planned_bytes"] == result["deleted_bytes"]
+    assert result["deleted_partition_dates"] == ["2026-07-20"]
+    assert result["partial_file_count"] == 1
+    assert len(str(result["receipt_fingerprint"])) == 64
+    assert not list(raw.rglob("*.jsonl"))
+    assert active.exists()
+    assert (archive / "catalog.json").is_file()
+    assert json.loads(receipt_path.read_bytes()) == result
+
+
+def test_retention_apply_rejects_wrong_confirmation_without_deletion(
+    tmp_path: Path,
+) -> None:
+    raw, archive = _build_archive(tmp_path)
+    plan = plan_raw_retention(
+        raw,
+        archive,
+        retention_days=7,
+        as_of_date="2026-07-28",
+    )
+    plan_path = tmp_path / "approved-plan.json"
+    receipt_path = tmp_path / "receipt.json"
+    _save_retention_plan(plan_path, plan.to_dict())
+
+    with pytest.raises(ArchiveError, match="confirmed plan fingerprint"):
+        apply_raw_retention(
+            raw,
+            archive,
+            plan_path=plan_path,
+            confirmed_plan_fingerprint="0" * 64,
+            receipt_path=receipt_path,
+        )
+
+    assert len(list(raw.rglob("*.jsonl"))) == 4
+    assert not receipt_path.exists()
+
+
+def test_retention_apply_rejects_changed_raw_before_any_deletion(tmp_path: Path) -> None:
+    raw, archive = _build_archive(tmp_path)
+    plan = plan_raw_retention(
+        raw,
+        archive,
+        retention_days=7,
+        as_of_date="2026-07-28",
+    )
+    plan_path = tmp_path / "approved-plan.json"
+    receipt_path = tmp_path / "receipt.json"
+    _save_retention_plan(plan_path, plan.to_dict())
+    changed = next((raw / "ticker").rglob("*.jsonl"))
+    changed.write_bytes(changed.read_bytes() + b" ")
+
+    with pytest.raises(ArchiveError, match="preflight contains blockers"):
+        apply_raw_retention(
+            raw,
+            archive,
+            plan_path=plan_path,
+            confirmed_plan_fingerprint=plan.plan_fingerprint,
+            receipt_path=receipt_path,
+        )
+
+    assert len(list(raw.rglob("*.jsonl"))) == 4
+    assert not receipt_path.exists()
+
+
+def test_retention_apply_rejects_tampered_or_unsafe_plan(tmp_path: Path) -> None:
+    raw, archive = _build_archive(tmp_path)
+    plan = plan_raw_retention(
+        raw,
+        archive,
+        retention_days=7,
+        as_of_date="2026-07-28",
+    )
+    payload = plan.to_dict()
+    candidates = payload["candidate_files"]
+    assert isinstance(candidates, list)
+    candidate = candidates[0]
+    assert isinstance(candidate, dict)
+    candidate["path"] = "../outside.jsonl"
+    plan_path = tmp_path / "tampered-plan.json"
+    _save_retention_plan(plan_path, payload)
+
+    with pytest.raises(ArchiveError, match="safe relative path"):
+        apply_raw_retention(
+            raw,
+            archive,
+            plan_path=plan_path,
+            confirmed_plan_fingerprint=plan.plan_fingerprint,
+            receipt_path=tmp_path / "receipt.json",
+        )
+
+    assert len(list(raw.rglob("*.jsonl"))) == 4
+
+
+def test_retention_apply_never_overwrites_existing_receipt(tmp_path: Path) -> None:
+    raw, archive = _build_archive(tmp_path)
+    plan = plan_raw_retention(
+        raw,
+        archive,
+        retention_days=7,
+        as_of_date="2026-07-28",
+    )
+    plan_path = tmp_path / "approved-plan.json"
+    receipt_path = tmp_path / "receipt.json"
+    _save_retention_plan(plan_path, plan.to_dict())
+    receipt_path.write_text("keep-me\n", encoding="utf-8")
+
+    with pytest.raises(ArchiveError, match="receipt already exists"):
+        apply_raw_retention(
+            raw,
+            archive,
+            plan_path=plan_path,
+            confirmed_plan_fingerprint=plan.plan_fingerprint,
+            receipt_path=receipt_path,
+        )
+
+    assert receipt_path.read_text(encoding="utf-8") == "keep-me\n"
+    assert len(list(raw.rglob("*.jsonl"))) == 4
+
+
+def test_retention_apply_writes_partial_failure_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw, archive = _build_archive(tmp_path)
+    plan = plan_raw_retention(
+        raw,
+        archive,
+        retention_days=7,
+        as_of_date="2026-07-28",
+    )
+    plan_path = tmp_path / "approved-plan.json"
+    receipt_path = tmp_path / "receipt.json"
+    _save_retention_plan(plan_path, plan.to_dict())
+    original = archive_module._verified_candidate_path
+    calls = 0
+
+    def fail_second_candidate(
+        selected_raw: Path, candidate: RetentionCandidate
+    ) -> Path:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise ArchiveError("simulated unlink precondition failure")
+        return original(selected_raw, candidate)
+
+    monkeypatch.setattr(
+        archive_module, "_verified_candidate_path", fail_second_candidate
+    )
+    with pytest.raises(ArchiveError, match="simulated unlink precondition failure"):
+        apply_raw_retention(
+            raw,
+            archive,
+            plan_path=plan_path,
+            confirmed_plan_fingerprint=plan.plan_fingerprint,
+            receipt_path=receipt_path,
+        )
+
+    receipt = json.loads(receipt_path.read_bytes())
+    assert receipt["ok"] is False
+    assert receipt["status"] == "failed"
+    assert receipt["deletion_performed"] is True
+    assert receipt["deleted_file_count"] == 1
+    assert receipt["failed_path"] == plan.candidates[1].path
+    assert len(list(raw.rglob("*.jsonl"))) == 3
 
 
 def test_research_source_reads_verified_daily_archive_catalog(tmp_path: Path) -> None:

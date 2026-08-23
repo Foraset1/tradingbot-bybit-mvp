@@ -1,13 +1,14 @@
-"""Immutable daily Parquet archive and conservative raw-retention planning.
+"""Immutable daily Parquet archive and verified raw-retention operations.
 
 The collector keeps writing the current UTC partition while this module audits and
 archives a fully elapsed day.  A day manifest is the commit marker: orphaned audit or
 canonical outputs are harmless and can be reused, while retention only trusts a
 committed day whose canonical files pass their full integrity validation.
 
-This module intentionally does not delete raw data.  ``plan_raw_retention`` produces
-an exact dry-run plan; a separate, explicitly reviewed stage can implement deletion
-after the plan has been exercised on the server.
+``plan_raw_retention`` produces an exact dry-run plan.  ``apply_raw_retention`` is a
+separate, explicit operation which accepts that saved plan, requires its fingerprint as
+an operator confirmation, repeats every archive/raw integrity check under the archive
+lock, and only then unlinks the exact approved files.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -35,6 +37,7 @@ from tradingbot.data.quality import attach_archive_acceptance
 ARCHIVE_DAY_SCHEMA_VERSION: Final = 1
 ARCHIVE_CATALOG_SCHEMA_VERSION: Final = 1
 RETENTION_PLAN_SCHEMA_VERSION: Final = 1
+RETENTION_APPLY_SCHEMA_VERSION: Final = 1
 
 
 class ArchiveError(RuntimeError):
@@ -211,6 +214,10 @@ class RetentionPlan:
             "safe_to_apply": self.safe_to_apply,
             "plan_fingerprint": self.plan_fingerprint,
         }
+
+
+def _utc_now_text() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _sha256_file(path: Path) -> str:
@@ -1125,3 +1132,517 @@ def plan_raw_retention(
         partial_files=partial_paths,
         plan_fingerprint=_sha256_json(fingerprint_payload),
     )
+
+
+def load_retention_plan(plan_path: str | Path) -> RetentionPlan:
+    """Load and fully validate a saved dry-run retention plan."""
+
+    selected = Path(plan_path).expanduser().resolve()
+    raw = _load_json(selected, "retention plan")
+    if raw.get("retention_plan_schema_version") != RETENTION_PLAN_SCHEMA_VERSION:
+        raise ArchiveError("retention plan uses another schema version")
+    if raw.get("mode") != "dry_run":
+        raise ArchiveError("retention plan mode must be dry_run")
+    if raw.get("deletion_performed") is not False:
+        raise ArchiveError("retention plan must not report a performed deletion")
+
+    raw_root_text = _required_string(raw.get("raw_root"), "raw_root")
+    archive_root_text = _required_string(raw.get("archive_root"), "archive_root")
+    raw_root = Path(raw_root_text).expanduser().resolve()
+    archive_root = Path(archive_root_text).expanduser().resolve()
+    _validate_separate_roots(raw_root, archive_root)
+    as_of = _parse_date(
+        _required_string(raw.get("as_of_date"), "as_of_date"), "as_of_date"
+    )
+    if as_of > datetime.now(UTC).date():
+        raise ArchiveError("retention plan as_of_date cannot be in the future")
+    retention_days = _required_nonnegative_int(
+        raw.get("retention_days"), "retention_days"
+    )
+    if retention_days == 0:
+        raise ArchiveError("retention_days must be a positive integer")
+    cutoff = _parse_date(
+        _required_string(raw.get("delete_before_date"), "delete_before_date"),
+        "delete_before_date",
+    )
+    if cutoff != as_of - timedelta(days=retention_days):
+        raise ArchiveError("retention plan delete_before_date is inconsistent")
+    catalog_fingerprint = _valid_sha256(
+        raw.get("catalog_fingerprint"), "catalog_fingerprint"
+    )
+
+    raw_candidates = raw.get("candidate_files")
+    if not isinstance(raw_candidates, list):
+        raise ArchiveError("retention plan candidate_files must be an array")
+    candidates: list[RetentionCandidate] = []
+    for index, raw_candidate in enumerate(raw_candidates):
+        candidate = _json_object(
+            raw_candidate, f"retention plan candidate_files[{index}]"
+        )
+        relative = _safe_relative_path(
+            candidate.get("path"), f"candidate_files[{index}].path"
+        )
+        path_text = relative.as_posix()
+        if not path_text.endswith(".jsonl"):
+            raise ArchiveError(
+                f"candidate_files[{index}].path must name a completed JSONL file"
+            )
+        partition = _raw_partition(path_text)
+        if partition is None:
+            raise ArchiveError(
+                f"candidate_files[{index}].path has an invalid raw partition"
+            )
+        partition_text = _parse_date(
+            _required_string(
+                candidate.get("partition_date"),
+                f"candidate_files[{index}].partition_date",
+            ),
+            f"candidate_files[{index}].partition_date",
+        ).isoformat()
+        if partition.isoformat() != partition_text:
+            raise ArchiveError(
+                f"candidate_files[{index}] path and partition_date differ"
+            )
+        if partition >= cutoff:
+            raise ArchiveError(
+                f"candidate_files[{index}] is not older than delete_before_date"
+            )
+        candidates.append(
+            RetentionCandidate(
+                path=path_text,
+                partition_date=partition_text,
+                bytes=_required_nonnegative_int(
+                    candidate.get("bytes"), f"candidate_files[{index}].bytes"
+                ),
+                sha256=_valid_sha256(
+                    candidate.get("sha256"), f"candidate_files[{index}].sha256"
+                ),
+            )
+        )
+    candidate_paths = tuple(item.path for item in candidates)
+    if candidate_paths != tuple(sorted(candidate_paths)):
+        raise ArchiveError("retention plan candidate_files must be sorted by path")
+    if len(set(candidate_paths)) != len(candidate_paths):
+        raise ArchiveError("retention plan candidate_files contain duplicate paths")
+    candidate_file_count = _required_nonnegative_int(
+        raw.get("candidate_file_count"), "candidate_file_count"
+    )
+    candidate_bytes = _required_nonnegative_int(
+        raw.get("candidate_bytes"), "candidate_bytes"
+    )
+    if candidate_file_count != len(candidates):
+        raise ArchiveError("retention plan candidate_file_count is inconsistent")
+    if candidate_bytes != sum(item.bytes for item in candidates):
+        raise ArchiveError("retention plan candidate_bytes is inconsistent")
+
+    raw_blockers = raw.get("blockers")
+    if not isinstance(raw_blockers, list):
+        raise ArchiveError("retention plan blockers must be an array")
+    blocker_count = _required_nonnegative_int(
+        raw.get("blocker_count"), "blocker_count"
+    )
+    if raw_blockers or blocker_count != 0:
+        raise ArchiveError("retention plan contains blockers")
+
+    raw_partials = raw.get("partial_files")
+    if not isinstance(raw_partials, list):
+        raise ArchiveError("retention plan partial_files must be an array")
+    partial_files: list[str] = []
+    for index, value in enumerate(raw_partials):
+        relative = _safe_relative_path(value, f"partial_files[{index}]")
+        path_text = relative.as_posix()
+        if not path_text.endswith(".jsonl.partial"):
+            raise ArchiveError(
+                f"partial_files[{index}] must name an active JSONL partial file"
+            )
+        if _raw_partition(path_text.removesuffix(".partial")) is None:
+            raise ArchiveError(f"partial_files[{index}] has an invalid raw partition")
+        partial_files.append(path_text)
+    if tuple(partial_files) != tuple(sorted(partial_files)):
+        raise ArchiveError("retention plan partial_files must be sorted by path")
+    if len(set(partial_files)) != len(partial_files):
+        raise ArchiveError("retention plan partial_files contain duplicate paths")
+    partial_file_count = _required_nonnegative_int(
+        raw.get("partial_file_count"), "partial_file_count"
+    )
+    if partial_file_count != len(partial_files):
+        raise ArchiveError("retention plan partial_file_count is inconsistent")
+
+    retained_recent_files = _required_nonnegative_int(
+        raw.get("retained_recent_files"), "retained_recent_files"
+    )
+    retained_recent_bytes = _required_nonnegative_int(
+        raw.get("retained_recent_bytes"), "retained_recent_bytes"
+    )
+    safe_to_apply = bool(candidates)
+    if raw.get("safe_to_apply") is not safe_to_apply:
+        raise ArchiveError("retention plan safe_to_apply is inconsistent")
+    if not safe_to_apply:
+        raise ArchiveError("retention plan has no candidate files")
+
+    expected_fingerprint = _valid_sha256(
+        raw.get("plan_fingerprint"), "plan_fingerprint"
+    )
+    fingerprint_payload = {
+        "retention_plan_schema_version": RETENTION_PLAN_SCHEMA_VERSION,
+        "raw_root": raw_root_text,
+        "archive_root": archive_root_text,
+        "as_of_date": as_of.isoformat(),
+        "retention_days": retention_days,
+        "delete_before_date": cutoff.isoformat(),
+        "catalog_fingerprint": catalog_fingerprint,
+        "candidates": [item.to_dict() for item in candidates],
+        "blockers": [],
+        "retained_recent_files": retained_recent_files,
+        "retained_recent_bytes": retained_recent_bytes,
+        "partial_files": partial_files,
+    }
+    if _sha256_json(fingerprint_payload) != expected_fingerprint:
+        raise ArchiveError("retention plan fingerprint does not match its contents")
+    return RetentionPlan(
+        raw_root=raw_root,
+        archive_root=archive_root,
+        as_of_date=as_of.isoformat(),
+        retention_days=retention_days,
+        delete_before_date=cutoff.isoformat(),
+        catalog_fingerprint=catalog_fingerprint,
+        candidates=tuple(candidates),
+        blockers=(),
+        retained_recent_files=retained_recent_files,
+        retained_recent_bytes=retained_recent_bytes,
+        partial_files=tuple(partial_files),
+        plan_fingerprint=expected_fingerprint,
+    )
+
+
+def _validate_retention_control_path(
+    path: Path,
+    *,
+    raw_root: Path,
+    archive_root: Path,
+    label: str,
+) -> None:
+    if path in (raw_root, archive_root) or path.is_relative_to(
+        raw_root
+    ) or path.is_relative_to(archive_root):
+        raise ArchiveError(f"{label} must be outside raw and archive roots")
+
+
+def _validate_destructive_raw_root(raw_root: Path) -> None:
+    filesystem_root = Path(raw_root.anchor).resolve()
+    if raw_root == filesystem_root:
+        raise ArchiveError("refusing retention apply against a filesystem root")
+    if raw_root == Path.home().resolve():
+        raise ArchiveError("refusing retention apply against the current home directory")
+    if not raw_root.is_dir():
+        raise ArchiveError(f"raw root does not exist: {raw_root}")
+
+
+def _candidate_diff_details(
+    approved: Sequence[RetentionCandidate],
+    current: Sequence[RetentionCandidate],
+) -> dict[str, object]:
+    approved_by_path = {item.path: item for item in approved}
+    current_by_path = {item.path: item for item in current}
+    missing = sorted(set(approved_by_path) - set(current_by_path))
+    unexpected = sorted(set(current_by_path) - set(approved_by_path))
+    changed = sorted(
+        path
+        for path in set(approved_by_path) & set(current_by_path)
+        if approved_by_path[path] != current_by_path[path]
+    )
+    return {
+        "approved_candidate_file_count": len(approved),
+        "current_candidate_file_count": len(current),
+        "missing_approved_file_count": len(missing),
+        "unexpected_candidate_file_count": len(unexpected),
+        "changed_candidate_file_count": len(changed),
+        "missing_approved_file_samples": missing[:20],
+        "unexpected_candidate_file_samples": unexpected[:20],
+        "changed_candidate_file_samples": changed[:20],
+    }
+
+
+def _verified_candidate_path(raw_root: Path, candidate: RetentionCandidate) -> Path:
+    relative = _safe_relative_path(candidate.path, "retention candidate path")
+    path = raw_root.joinpath(*relative.parts)
+    cursor = raw_root
+    for part in relative.parts:
+        cursor /= part
+        if cursor.is_symlink():
+            raise ArchiveError(
+                f"retention candidate path contains a symbolic link: {candidate.path}"
+            )
+    try:
+        resolved = path.resolve(strict=True)
+        before = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise ArchiveError(
+            f"retention candidate is unavailable: {candidate.path}: {exc}"
+        ) from exc
+    if not resolved.is_relative_to(raw_root):
+        raise ArchiveError(f"retention candidate escapes raw root: {candidate.path}")
+    if not stat.S_ISREG(before.st_mode):
+        raise ArchiveError(f"retention candidate is not a regular file: {candidate.path}")
+    if before.st_size != candidate.bytes:
+        raise ArchiveError(f"retention candidate size changed: {candidate.path}")
+    if _sha256_file(path) != candidate.sha256:
+        raise ArchiveError(f"retention candidate SHA-256 changed: {candidate.path}")
+    try:
+        after = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise ArchiveError(
+            f"retention candidate changed during verification: {candidate.path}: {exc}"
+        ) from exc
+    before_signature = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    after_signature = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    if before_signature != after_signature:
+        raise ArchiveError(
+            f"retention candidate changed during verification: {candidate.path}"
+        )
+    return path
+
+
+def _retention_apply_payload(
+    *,
+    ok: bool,
+    status: str,
+    plan: RetentionPlan,
+    plan_path: Path,
+    plan_sha256: str,
+    receipt_path: Path,
+    current_catalog_fingerprint: str,
+    started_at: str,
+    completed_at: str | None,
+    deleted_files: Sequence[RetentionCandidate],
+    current_partition_date: str | None,
+    retained_recent_files: int,
+    retained_recent_bytes: int,
+    partial_files: Sequence[str],
+    error: str | None = None,
+    failed_path: str | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "retention_apply_schema_version": RETENTION_APPLY_SCHEMA_VERSION,
+        "ok": ok,
+        "mode": "apply",
+        "status": status,
+        "deletion_performed": bool(deleted_files),
+        "started_at": started_at,
+        "completed_at": completed_at,
+        "raw_root": plan.raw_root.as_posix(),
+        "archive_root": plan.archive_root.as_posix(),
+        "source_plan_path": plan_path.as_posix(),
+        "source_plan_sha256": plan_sha256,
+        "receipt_path": receipt_path.as_posix(),
+        "plan_fingerprint": plan.plan_fingerprint,
+        "approved_catalog_fingerprint": plan.catalog_fingerprint,
+        "current_catalog_fingerprint": current_catalog_fingerprint,
+        "as_of_date": plan.as_of_date,
+        "retention_days": plan.retention_days,
+        "delete_before_date": plan.delete_before_date,
+        "planned_file_count": len(plan.candidates),
+        "planned_bytes": sum(item.bytes for item in plan.candidates),
+        "deleted_files": [item.to_dict() for item in deleted_files],
+        "deleted_file_count": len(deleted_files),
+        "deleted_bytes": sum(item.bytes for item in deleted_files),
+        "deleted_partition_dates": sorted(
+            {item.partition_date for item in deleted_files}
+        ),
+        "current_partition_date": current_partition_date,
+        "retained_recent_files": retained_recent_files,
+        "retained_recent_bytes": retained_recent_bytes,
+        "partial_files": list(partial_files),
+        "partial_file_count": len(partial_files),
+        "error": error,
+        "failed_path": failed_path,
+    }
+    payload["receipt_fingerprint"] = _sha256_json(payload)
+    return payload
+
+
+def apply_raw_retention(
+    raw_root: str | Path,
+    archive_root: str | Path,
+    *,
+    plan_path: str | Path,
+    confirmed_plan_fingerprint: str,
+    receipt_path: str | Path,
+) -> dict[str, object]:
+    """Revalidate and apply one explicitly approved retention plan.
+
+    The saved plan, configured roots, catalog fingerprint, canonical archives, raw
+    candidate set, sizes and SHA-256 values must still match.  A durable receipt is
+    written before the first unlink and after every completed UTC partition.
+    """
+
+    raw = Path(raw_root).expanduser().resolve()
+    archive = Path(archive_root).expanduser().resolve()
+    selected_plan = Path(plan_path).expanduser().resolve()
+    receipt = Path(receipt_path).expanduser().resolve()
+    _validate_separate_roots(raw, archive)
+    _validate_destructive_raw_root(raw)
+    if not archive.is_dir():
+        raise ArchiveError(f"archive root does not exist: {archive}")
+    _validate_retention_control_path(
+        selected_plan,
+        raw_root=raw,
+        archive_root=archive,
+        label="retention plan",
+    )
+    _validate_retention_control_path(
+        receipt,
+        raw_root=raw,
+        archive_root=archive,
+        label="retention receipt",
+    )
+    if selected_plan == receipt:
+        raise ArchiveError("retention plan and receipt paths must differ")
+    if receipt.exists():
+        raise ArchiveError(f"retention receipt already exists: {receipt}")
+
+    plan = load_retention_plan(selected_plan)
+    confirmation = _valid_sha256(
+        confirmed_plan_fingerprint, "confirmed_plan_fingerprint"
+    )
+    if confirmation != plan.plan_fingerprint:
+        raise ArchiveError("confirmed plan fingerprint does not match the saved plan")
+    if plan.raw_root != raw:
+        raise ArchiveError("saved plan raw_root does not match the configured raw root")
+    if plan.archive_root != archive:
+        raise ArchiveError(
+            "saved plan archive_root does not match the configured archive root"
+        )
+    plan_sha256 = _sha256_file(selected_plan)
+
+    with _archive_lock(archive):
+        current = plan_raw_retention(
+            raw,
+            archive,
+            retention_days=plan.retention_days,
+            as_of_date=plan.as_of_date,
+        )
+        if current.catalog_fingerprint != plan.catalog_fingerprint:
+            raise ArchiveError(
+                "archive catalog changed after the approved retention plan was created",
+                details={
+                    "approved_catalog_fingerprint": plan.catalog_fingerprint,
+                    "current_catalog_fingerprint": current.catalog_fingerprint,
+                },
+            )
+        if current.blockers:
+            raise ArchiveError(
+                "current retention preflight contains blockers",
+                details={
+                    "blocker_count": len(current.blockers),
+                    "blockers": [item.to_dict() for item in current.blockers[:100]],
+                    "blockers_truncated": len(current.blockers) > 100,
+                },
+            )
+        if current.candidates != plan.candidates:
+            raise ArchiveError(
+                "current retention candidates do not exactly match the approved plan",
+                details=_candidate_diff_details(plan.candidates, current.candidates),
+            )
+
+        started_at = _utc_now_text()
+        deleted: list[RetentionCandidate] = []
+        current_partition: str | None = None
+        active_candidate: RetentionCandidate | None = None
+        preflight = _retention_apply_payload(
+            ok=False,
+            status="preflight_complete",
+            plan=plan,
+            plan_path=selected_plan,
+            plan_sha256=plan_sha256,
+            receipt_path=receipt,
+            current_catalog_fingerprint=current.catalog_fingerprint,
+            started_at=started_at,
+            completed_at=None,
+            deleted_files=deleted,
+            current_partition_date=None,
+            retained_recent_files=current.retained_recent_files,
+            retained_recent_bytes=current.retained_recent_bytes,
+            partial_files=current.partial_files,
+        )
+        _write_json_atomic(receipt, preflight)
+
+        candidates_by_date: dict[str, list[RetentionCandidate]] = {}
+        for candidate in plan.candidates:
+            candidates_by_date.setdefault(candidate.partition_date, []).append(candidate)
+        try:
+            for partition_date in sorted(candidates_by_date):
+                current_partition = partition_date
+                for candidate in candidates_by_date[partition_date]:
+                    active_candidate = candidate
+                    path = _verified_candidate_path(raw, candidate)
+                    try:
+                        path.unlink()
+                    except OSError as exc:
+                        raise ArchiveError(
+                            f"could not delete retention candidate {candidate.path}: {exc}"
+                        ) from exc
+                    deleted.append(candidate)
+                active_candidate = None
+                progress = _retention_apply_payload(
+                    ok=False,
+                    status="applying",
+                    plan=plan,
+                    plan_path=selected_plan,
+                    plan_sha256=plan_sha256,
+                    receipt_path=receipt,
+                    current_catalog_fingerprint=current.catalog_fingerprint,
+                    started_at=started_at,
+                    completed_at=None,
+                    deleted_files=deleted,
+                    current_partition_date=current_partition,
+                    retained_recent_files=current.retained_recent_files,
+                    retained_recent_bytes=current.retained_recent_bytes,
+                    partial_files=current.partial_files,
+                )
+                _write_json_atomic(receipt, progress)
+        except (ArchiveError, OSError) as exc:
+            failure = _retention_apply_payload(
+                ok=False,
+                status="failed",
+                plan=plan,
+                plan_path=selected_plan,
+                plan_sha256=plan_sha256,
+                receipt_path=receipt,
+                current_catalog_fingerprint=current.catalog_fingerprint,
+                started_at=started_at,
+                completed_at=_utc_now_text(),
+                deleted_files=deleted,
+                current_partition_date=current_partition,
+                retained_recent_files=current.retained_recent_files,
+                retained_recent_bytes=current.retained_recent_bytes,
+                partial_files=current.partial_files,
+                error=str(exc),
+                failed_path=(None if active_candidate is None else active_candidate.path),
+            )
+            _write_json_atomic(receipt, failure)
+            raise ArchiveError(str(exc), details=failure) from exc
+
+        result = _retention_apply_payload(
+            ok=True,
+            status="complete",
+            plan=plan,
+            plan_path=selected_plan,
+            plan_sha256=plan_sha256,
+            receipt_path=receipt,
+            current_catalog_fingerprint=current.catalog_fingerprint,
+            started_at=started_at,
+            completed_at=_utc_now_text(),
+            deleted_files=deleted,
+            current_partition_date=None,
+            retained_recent_files=current.retained_recent_files,
+            retained_recent_bytes=current.retained_recent_bytes,
+            partial_files=current.partial_files,
+        )
+        _write_json_atomic(receipt, result)
+        return result

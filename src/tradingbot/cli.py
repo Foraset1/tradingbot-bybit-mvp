@@ -296,6 +296,39 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="Optionally write the dry-run JSON atomically to this path",
     )
+    apply_retention = subparsers.add_parser(
+        "apply-retention",
+        help="Revalidate and delete only files from one explicitly approved plan",
+    )
+    apply_retention.add_argument(
+        "--plan",
+        type=Path,
+        required=True,
+        help="Saved plan-retention JSON to verify and apply",
+    )
+    apply_retention.add_argument(
+        "--confirm-plan-fingerprint",
+        required=True,
+        help="Exact plan_fingerprint copied from the reviewed plan",
+    )
+    apply_retention.add_argument(
+        "--root",
+        type=Path,
+        default=None,
+        help="Raw root (defaults to storage.root)",
+    )
+    apply_retention.add_argument(
+        "--archive-root",
+        type=Path,
+        default=None,
+        help="Archive root (defaults to archive.root)",
+    )
+    apply_retention.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Required durable JSON receipt path outside raw/archive roots",
+    )
     history = subparsers.add_parser(
         "import-history",
         help="Stream official Bybit daily trades into compact 1s/1m Parquet bars",
@@ -881,6 +914,100 @@ def _run_retention_plan(
         raise SystemExit(1)
 
 
+def _retention_apply_summary(
+    payload: dict[str, object], output: Path
+) -> dict[str, object]:
+    keys = (
+        "retention_apply_schema_version",
+        "ok",
+        "mode",
+        "status",
+        "deletion_performed",
+        "plan_fingerprint",
+        "delete_before_date",
+        "planned_file_count",
+        "planned_bytes",
+        "deleted_file_count",
+        "deleted_bytes",
+        "current_partition_date",
+        "error",
+        "failed_path",
+        "receipt_fingerprint",
+    )
+    summary = {key: payload.get(key) for key in keys if key in payload}
+    summary["receipt_path"] = output.expanduser().resolve().as_posix()
+    return summary
+
+
+def _run_retention_apply(
+    config: AppConfig,
+    plan_path: Path,
+    confirmed_plan_fingerprint: str,
+    raw_root: Path | None,
+    archive_root: Path | None,
+    output: Path,
+) -> None:
+    from tradingbot.data.archive import (
+        RETENTION_APPLY_SCHEMA_VERSION,
+        ArchiveError,
+        apply_raw_retention,
+    )
+
+    selected_output = output.expanduser().resolve()
+    selected_raw = (
+        config.storage.root if raw_root is None else raw_root
+    ).expanduser().resolve()
+    selected_archive = (
+        config.archive.root if archive_root is None else archive_root
+    ).expanduser().resolve()
+    output_existed_before = selected_output.exists()
+    output_is_control_safe = not (
+        selected_output in (selected_raw, selected_archive)
+        or selected_output.is_relative_to(selected_raw)
+        or selected_output.is_relative_to(selected_archive)
+    )
+    try:
+        payload = apply_raw_retention(
+            raw_root=selected_raw,
+            archive_root=selected_archive,
+            plan_path=plan_path,
+            confirmed_plan_fingerprint=confirmed_plan_fingerprint,
+            receipt_path=selected_output,
+        )
+    except ArchiveError as exc:
+        LOGGER.error("Retention apply rejected or failed: %s", exc)
+        payload = {
+            "retention_apply_schema_version": RETENTION_APPLY_SCHEMA_VERSION,
+            "ok": False,
+            "mode": "apply",
+            "status": "rejected",
+            "deletion_performed": False,
+            "error": str(exc),
+        }
+        payload.update(exc.details)
+        if output_existed_before:
+            payload["receipt_write_skipped"] = "output_already_existed"
+        elif not output_is_control_safe:
+            payload["receipt_write_skipped"] = "output_inside_data_roots"
+        else:
+            write_health(selected_output, payload)
+        print(
+            json.dumps(
+                _retention_apply_summary(payload, selected_output),
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise SystemExit(1) from exc
+    print(
+        json.dumps(
+            _retention_apply_summary(payload, selected_output),
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
 def _run_history_import(
     config: AppConfig,
     start_date: str,
@@ -1048,6 +1175,16 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.archive_root,
             args.retention_days,
             args.as_of_date,
+            args.output,
+        )
+        return
+    if args.command == "apply-retention":
+        _run_retention_apply(
+            config,
+            args.plan,
+            args.confirm_plan_fingerprint,
+            args.root,
+            args.archive_root,
             args.output,
         )
         return

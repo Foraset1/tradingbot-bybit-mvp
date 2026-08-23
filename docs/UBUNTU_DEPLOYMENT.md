@@ -15,8 +15,8 @@
 
 При наблюдаемом объёме около 2,71 GB/сутки диск 100 GB не подходит для бессрочного хранения
 JSONL. Целевое локальное окно raw — 7 дней с суточным Parquet-архивированием; disk guard
-сохраняет не менее 15 GiB свободного места. Текущая реализация формирует проверяемый dry-run
-retention, но сама старые данные ещё не удаляет. Порядок запуска описан в
+сохраняет не менее 15 GiB свободного места. Retention разделён на проверяемый dry-run и
+отдельное ручное применение с fingerprint-подтверждением. Порядок запуска описан в
 [`DAILY_ARCHIVE.md`](DAILY_ARCHIVE.md).
 
 Потоковый bootstrap официальных архивов сделок Bybit в компактные 1s/1m Parquet-bars
@@ -392,7 +392,8 @@ sudo docker compose ps
 - нет queue overflow и постоянных reconnect;
 - 24-часовой строгий audit вернул код `0`;
 - прогноз дискового объёма приемлем для выбранного retention;
-- суточный архив и dry-run retention проверены по [`DAILY_ARCHIVE.md`](DAILY_ARCHIVE.md);
+- суточный архив, dry-run и ручной retention apply проверены по
+  [`DAILY_ARCHIVE.md`](DAILY_ARCHIVE.md);
 - канонический Parquet dataset построен из неизменного audit manifest;
 - causal research dataset построен из принятого canonical manifest;
 - в manifest нет нулевого числа feature/label строк и проверены причины пропусков.
