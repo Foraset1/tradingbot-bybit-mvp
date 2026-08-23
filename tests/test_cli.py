@@ -9,7 +9,7 @@ import pytest
 from tradingbot.cli import _put_record, main
 from tradingbot.data import archive as archive_module
 from tradingbot.data import bybit_history
-from tradingbot.data.archive import ArchiveError
+from tradingbot.data.archive import ArchiveError, RetentionCandidate
 from tradingbot.data.bybit_history import HistoryRangeResult
 from tradingbot.market.bybit_public import CollectorStats
 from tradingbot.market.records import MarketRecord
@@ -150,6 +150,79 @@ def test_archive_day_failure_is_machine_readable_on_stdout_and_disk(
         "unsupported_warning_codes"
     ]
     assert json.loads(report_path.read_bytes()) == payload
+
+
+def test_apply_retention_command_prints_compact_summary_and_writes_receipt(
+    config_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    raw_root = tmp_path / "raw"
+    archive_root = tmp_path / "archive"
+    raw_root.mkdir()
+    archive_root.mkdir()
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text("{}\n", encoding="utf-8")
+    output = tmp_path / "receipt.json"
+    fingerprint = "a" * 64
+
+    def fake_apply(*args: object, **kwargs: object) -> dict[str, object]:
+        assert kwargs["raw_root"] == raw_root
+        assert kwargs["archive_root"] == archive_root
+        assert kwargs["plan_path"] == plan_path
+        assert kwargs["confirmed_plan_fingerprint"] == fingerprint
+        assert kwargs["receipt_path"] == output.resolve()
+        payload: dict[str, object] = {
+            "retention_apply_schema_version": 1,
+            "ok": True,
+            "mode": "apply",
+            "status": "complete",
+            "deletion_performed": True,
+            "plan_fingerprint": fingerprint,
+            "delete_before_date": "2026-07-21",
+            "planned_file_count": 1,
+            "planned_bytes": 10,
+            "deleted_files": [
+                RetentionCandidate(
+                    path="ticker/BTCUSDT/2026/07/20/part.jsonl",
+                    partition_date="2026-07-20",
+                    bytes=10,
+                    sha256="b" * 64,
+                ).to_dict()
+            ],
+            "deleted_file_count": 1,
+            "deleted_bytes": 10,
+            "receipt_fingerprint": "c" * 64,
+        }
+        output.write_text(json.dumps(payload), encoding="utf-8")
+        return payload
+
+    monkeypatch.setattr(archive_module, "apply_raw_retention", fake_apply)
+    main(
+        [
+            "--config",
+            str(config_path),
+            "apply-retention",
+            "--plan",
+            str(plan_path),
+            "--confirm-plan-fingerprint",
+            fingerprint,
+            "--root",
+            str(raw_root),
+            "--archive-root",
+            str(archive_root),
+            "--output",
+            str(output),
+        ]
+    )
+
+    summary = json.loads(capsys.readouterr().out)
+    receipt = json.loads(output.read_bytes())
+    assert summary["ok"] is True
+    assert summary["deleted_file_count"] == 1
+    assert "deleted_files" not in summary
+    assert len(receipt["deleted_files"]) == 1
 
 
 @pytest.mark.asyncio

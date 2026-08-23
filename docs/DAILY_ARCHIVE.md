@@ -150,9 +150,69 @@ jq '{mode,delete_before_date,candidate_file_count,candidate_bytes,blocker_count,
 Пока кандидатов нет (сбор идёт меньше семи дней), `safe_to_apply` будет `false`, но при
 `blocker_count: 0` это нормальный результат: удалять просто нечего.
 
-Флаг `--apply` намеренно отсутствует. Сначала нужны 2–3 успешных суточных
-архива и сохранённые dry-run отчёты. После их аудита добавляется отдельное подтверждаемое
-удаление и systemd timer; до этого raw остаётся нетронутым.
+## Подтверждаемое применение retention
+
+`apply-retention` является отдельной командой и не может запускаться одним флагом у
+dry-run. Перед применением оператор должен сохранить и проверить полный JSON-план. Команда
+требует этот файл, точный `plan_fingerprint` и новый путь для неизменяемого отчёта.
+
+Перед первым удалением команда под archive lock повторяет полную проверку:
+
+- схема, внутренние счётчики и fingerprint сохранённого плана;
+- совпадение настроенных `/data/raw` и `/data/archive` с планом;
+- неизменность `catalog_fingerprint`;
+- manifest и SHA-256 всех Parquet-файлов затрагиваемых дней;
+- точное совпадение текущего списка старых raw-файлов со списком кандидатов;
+- размер и SHA-256 каждого raw-файла;
+- отсутствие blocker, path traversal, symlink и уже существующего receipt.
+
+После общего preflight каждый файл ещё раз проверяется непосредственно перед `unlink`.
+Последние семь дней, новые файлы и `.jsonl.partial` не входят в список и не удаляются.
+Receipt атомарно создаётся до первого удаления, обновляется после каждого полностью
+обработанного UTC-дня и содержит полный список фактически удалённых файлов.
+
+Запускать применение нужно в `tmux`. План и receipt находятся в домашнем каталоге, поэтому
+он монтируется в одноразовый контейнер отдельно от `/data`:
+
+```bash
+cd /opt/tradingbot
+REPORT_DIR=/home/foraset1/tradingbot-reports
+PLAN="$REPORT_DIR/retention-plan-20260822-181700.json"
+PLAN_NAME=$(basename "$PLAN")
+FINGERPRINT=$(jq -er '.plan_fingerprint' "$PLAN") || exit 1
+STAMP=$(date -u +%Y%m%d-%H%M%S)
+RECEIPT="$REPORT_DIR/retention-apply-$STAMP.json"
+SUMMARY="$REPORT_DIR/retention-apply-$STAMP-summary.json"
+LOG="$REPORT_DIR/retention-apply-$STAMP.log"
+
+sudo docker compose run --rm --no-deps \
+  --volume "$REPORT_DIR:/reports" \
+  collector \
+  python -m tradingbot apply-retention \
+  --plan "/reports/$PLAN_NAME" \
+  --confirm-plan-fingerprint "$FINGERPRINT" \
+  --output "/reports/$(basename "$RECEIPT")" \
+  > "$SUMMARY" 2> "$LOG"
+
+STATUS=$?
+sudo chown foraset1:foraset1 "$RECEIPT" "$SUMMARY" "$LOG"
+echo "exit=$STATUS"
+jq '{ok,status,deletion_performed,planned_file_count,deleted_file_count,planned_bytes,deleted_bytes,error,failed_path,receipt_fingerprint}' \
+  "$RECEIPT"
+sudo docker compose ps
+sudo docker compose exec collector sh -c \
+  'du -sh /data/raw /data/archive /data/history 2>/dev/null; df -h /data'
+```
+
+Нормальное завершение имеет `exit=0`, `ok=true`, `status=complete`, одинаковые planned и
+deleted counts/bytes и непустой `receipt_fingerprint`. Stdout намеренно содержит только
+компактную сводку; полный список находится в receipt.
+
+Если каталог, архив или raw изменились после dry-run, команда завершается до удаления и
+нужно построить новый план. Если процесс был аварийно остановлен уже после части удалений,
+не следует повторно использовать тот же receipt: сохраните его, постройте новый dry-run по
+оставшимся файлам и сначала проведите отдельный аудит результата. Автоматический timer для
+destructive apply пока намеренно не настраивается.
 
 ## Построение общего research dataset
 
