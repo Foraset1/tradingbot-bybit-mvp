@@ -67,7 +67,8 @@ entry_order_ttl_seconds = 45
 
 [evaluation]
 # Research-only assumptions. Replace fee values with the account's actual tier before
-# interpreting any cost-aware report. Maker fill and queue position are not modeled here.
+# interpreting any cost-aware report. `run-backtest` does not model maker fills;
+# `run-execution-backtest` applies the separate public-data V3 fill proxy.
 horizon_minutes = 60
 embargo_minutes = 60
 minimum_train_days = 30

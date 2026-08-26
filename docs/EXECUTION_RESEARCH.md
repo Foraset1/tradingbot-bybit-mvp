@@ -215,18 +215,84 @@ tmux attach -t execution-v3
 Повтор той же команды безопасен: при совпадающих source и параметрах проверенный dataset
 будет переиспользован с `"reused": true`.
 
+## Execution-aware evaluation
+
+Оценка намеренно разделена на две независимые multiclass-модели:
+
+1. `NO_FILL / PARTIAL_FILL / FULL_FILL` обучается на всех maker-кандидатах;
+2. `SL_FIRST / TIMEOUT / TP_FIRST` обучается только на строках с наблюдаемым proxy
+   `FULL_FILL`, но выдаёт условные вероятности для каждого нового кандидата.
+
+Их вероятности объединяются в net EV после maker/taker fee, funding и заданного slippage.
+`NO_FILL` не меняет equity. При `PARTIAL_FILL` симулятор отменяет остаток и немедленно закрывает
+исполненную долю taker-ордером. При `FULL_FILL` TP считается maker, а SL и закрытие по времени —
+taker. Одновременно на все шесть пар допускается только один активный ордер или позиция.
+
+Один запуск выбирает ровно один из заранее записанных горизонтов и один reference-номинал. Это
+не позволяет случайно смешать дублирующиеся сценарии одного решения и делает сравнения явными.
+Первичный smoke-сценарий для накопленных 28 дней:
+
+```bash
+set +e
+cd /opt/tradingbot
+
+REPORT_DIR=/home/foraset1/tradingbot-reports
+EXECUTION_DATASET=/data/execution-research/execution-research-v1-<fingerprint>
+STAMP=$(date -u +%Y%m%d-%H%M%S)
+BUILD="$REPORT_DIR/execution-backtest-h15-n50-$STAMP-build.json"
+LOG="$REPORT_DIR/execution-backtest-h15-n50-$STAMP.log"
+
+docker compose run --rm --no-deps collector \
+  python -m tradingbot run-execution-backtest \
+  --execution-dataset "$EXECUTION_DATASET" \
+  --output-root /data/execution-evaluations \
+  --horizon-minutes 15 \
+  --order-notional-usdt 50 \
+  > "$BUILD" 2> "$LOG"
+
+STATUS=$?
+sudo chown foraset1:foraset1 "$BUILD" "$LOG"
+echo "exit=$STATUS"
+jq . "$BUILD"
+grep -Ei 'warning|error|traceback|killed|oom' "$LOG" || true
+docker compose ps
+```
+
+При `exit=0` сохранить полные immutable outputs:
+
+```bash
+RESULT_PATH=$(jq -r '.experiment_path' "$BUILD")
+REPORT="$REPORT_DIR/execution-backtest-h15-n50-$STAMP-report.json"
+MANIFEST="$REPORT_DIR/execution-backtest-h15-n50-$STAMP-manifest.json"
+
+docker compose run --rm --no-deps collector \
+  sh -c "cat '$RESULT_PATH/report.json'" > "$REPORT"
+docker compose run --rm --no-deps collector \
+  sh -c "cat '$RESULT_PATH/manifest.json'" > "$MANIFEST"
+sudo chown foraset1:foraset1 "$REPORT" "$MANIFEST"
+
+jq '{experiment_id,selected_execution_scenario,fold_count,data_gate,scope}' "$REPORT"
+```
+
+На физическом сервере 4 CPU / 8 GB сценарии запускаются последовательно: сначала H15/N50,
+после разбора отчёта — H30/N50 и затем другие номиналы, если сравнение действительно нужно.
+Повтор идентичной команды проверяет SHA-256 всех outputs и возвращает `"reused": true`.
+
 ## Как интерпретировать результат
 
-Этот dataset разрешено использовать для обучения fill-модели и последующего
-execution-aware backtest. Его **нельзя** трактовать как доказательство прибыльности:
+Этот dataset и отчёт evaluator разрешено использовать для отбора исследовательского кандидата.
+Их **нельзя** трактовать как доказательство прибыльности:
 
 - реальный order acknowledgement и фактическая queue position не наблюдаются;
 - модификации/отмены книги между снимками не восстанавливают очередь полностью;
 - hidden/iceberg liquidity неизвестна;
-- шаг количества, минимальный ордер, комиссии, funding и slippage выхода ещё должны быть
-  применены в simulator;
-- partial fill пока является отдельным классом, а не автоматически полноценной позицией.
+- комиссии, funding и настраиваемый slippage применяются, но реальное проскальзывание ещё не
+  наблюдается;
+- reference-номинал доказывает proxy fill только для выбранного размера, а не для произвольного
+  будущего депозита;
+- partial fill закрывается защитной taker-политикой, которую ещё нужно подтвердить в Demo.
 
-Следующий gate после успешной сборки: проверить coverage/fill distributions, затем обучить
-отдельную модель вероятности `FULL_FILL` и объединить её с post-fill EV. До этого V2 H15
-остаётся только исследовательским кандидатом, а H30/H60 не допускаются к торговле.
+История короче 44 дней остаётся `technical_smoke`. Следующий gate после успешной H15/N50
+оценки — накопить достаточный V3 период для нескольких purged walk-forward folds, затем
+сопоставить proxy fills с Bybit Demo и запустить Shadow Mode. До прохождения этих gates ни один
+вариант не допускается к торговле.

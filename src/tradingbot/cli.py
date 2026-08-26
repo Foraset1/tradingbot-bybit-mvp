@@ -227,6 +227,44 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="Pre-registered barrier horizon override (15, 30, or 60 minutes)",
     )
+    execution_evaluation = subparsers.add_parser(
+        "run-execution-backtest",
+        help=(
+            "Fit separate maker-fill/outcome models and replay one order across "
+            "all pairs"
+        ),
+    )
+    execution_evaluation.add_argument(
+        "--execution-dataset",
+        type=Path,
+        required=True,
+        help="Verified execution-research-v1 directory containing manifest.json",
+    )
+    execution_evaluation.add_argument(
+        "--output-root",
+        type=Path,
+        default=None,
+        help=(
+            "Execution evaluation parent directory "
+            "(defaults to execution-evaluations beside storage.root)"
+        ),
+    )
+    execution_evaluation.add_argument(
+        "--horizon-minutes",
+        type=int,
+        choices=(15, 30),
+        default=15,
+        help="One pre-registered execution horizon to evaluate (default: 15)",
+    )
+    execution_evaluation.add_argument(
+        "--order-notional-usdt",
+        type=float,
+        default=50.0,
+        help=(
+            "One pre-registered maker-order size to evaluate "
+            "(default: 50 USDT)"
+        ),
+    )
     archive = subparsers.add_parser(
         "archive-day",
         help=(
@@ -819,6 +857,55 @@ def _run_backtest(
     print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
 
 
+def _run_execution_backtest(
+    config: AppConfig,
+    execution_dataset: Path,
+    output_root: Path | None,
+    horizon_minutes: int,
+    order_notional_usdt: float,
+) -> None:
+    try:
+        from tradingbot.research.evaluation_contracts import EvaluationError
+        from tradingbot.research.execution_evaluator import (
+            run_execution_evaluation,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name in {"lightgbm", "numpy", "pyarrow", "sklearn"} or (
+            exc.name or ""
+        ).startswith(("lightgbm.", "numpy.", "pyarrow.", "sklearn.")):
+            LOGGER.error(
+                "Execution backtest support is not installed; install the project "
+                "with the [research] extra"
+            )
+            raise SystemExit(1) from exc
+        raise
+
+    config = replace(
+        config,
+        evaluation=replace(
+            config.evaluation,
+            horizon_minutes=horizon_minutes,
+        ),
+    )
+    destination = (
+        config.storage.root.parent / "execution-evaluations"
+        if output_root is None
+        else output_root
+    )
+    try:
+        result = run_execution_evaluation(
+            execution_dataset=execution_dataset,
+            output_root=destination,
+            config=config,
+            order_notional_usdt=order_notional_usdt,
+            minimum_free_bytes=config.storage.min_free_bytes,
+        )
+    except EvaluationError as exc:
+        LOGGER.error("Execution-aware evaluation rejected: %s", exc)
+        raise SystemExit(1) from exc
+    print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+
+
 def _run_archive_day(
     config: AppConfig,
     partition_date: str | None,
@@ -1156,6 +1243,15 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.research_dataset,
             args.output_root,
             args.horizon_minutes,
+        )
+        return
+    if args.command == "run-execution-backtest":
+        _run_execution_backtest(
+            config,
+            args.execution_dataset,
+            args.output_root,
+            args.horizon_minutes,
+            args.order_notional_usdt,
         )
         return
     if args.command == "archive-day":
