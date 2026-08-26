@@ -70,6 +70,7 @@ def _time_uniform_training_sample(
     y_train: NDArray[np.int64],
     *,
     maximum_rows: int,
+    class_names: tuple[str, ...] = OUTCOME_NAMES,
 ) -> tuple[NDArray[np.float32], NDArray[np.int64]]:
     """Bound the baseline fit deterministically while retaining the full time span."""
 
@@ -77,7 +78,7 @@ def _time_uniform_training_sample(
         raise EvaluationError("logistic maximum training rows must be positive")
     if len(x_train) != len(y_train):
         raise EvaluationError("training feature and target rows do not match")
-    if maximum_rows < len(OUTCOME_NAMES):
+    if maximum_rows < len(class_names):
         raise EvaluationError(
             "logistic maximum training rows must cover every outcome"
         )
@@ -90,7 +91,7 @@ def _time_uniform_training_sample(
         dtype=np.int64,
     )
     sampled_outcomes = set(int(value) for value in y_train[indices])
-    for outcome_index in range(len(OUTCOME_NAMES)):
+    for outcome_index in range(len(class_names)):
         if outcome_index in sampled_outcomes:
             continue
         matching = np.flatnonzero(y_train == outcome_index)
@@ -106,6 +107,7 @@ class ProbabilityCalibrator:
     temperature: float
     prior_weight: float
     class_prior: NDArray[np.float64]
+    class_names: tuple[str, ...]
     calibration_log_loss_before: float
     calibration_log_loss_after: float
 
@@ -117,6 +119,7 @@ class ProbabilityCalibrator:
             temperature=self.temperature,
             prior_weight=self.prior_weight,
             class_prior=self.class_prior,
+            class_count=len(self.class_names),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -126,7 +129,7 @@ class ProbabilityCalibrator:
             "prior_weight": self.prior_weight,
             "class_prior": {
                 name: float(self.class_prior[index])
-                for index, name in enumerate(OUTCOME_NAMES)
+                for index, name in enumerate(self.class_names)
             },
             "calibration_log_loss_before": self.calibration_log_loss_before,
             "calibration_log_loss_after": self.calibration_log_loss_after,
@@ -134,20 +137,25 @@ class ProbabilityCalibrator:
 
 
 def _aligned_probabilities(
-    probabilities: NDArray[np.float64], classes: NDArray[np.int64]
+    probabilities: NDArray[np.float64],
+    classes: NDArray[np.int64],
+    *,
+    class_count: int = len(OUTCOME_NAMES),
 ) -> NDArray[np.float64]:
-    aligned = np.zeros((probabilities.shape[0], len(OUTCOME_NAMES)), dtype=np.float64)
+    aligned = np.zeros((probabilities.shape[0], class_count), dtype=np.float64)
     for source_column, outcome_index in enumerate(classes):
-        if not 0 <= int(outcome_index) < len(OUTCOME_NAMES):
+        if not 0 <= int(outcome_index) < class_count:
             raise EvaluationError(f"model returned an unknown class: {outcome_index}")
         aligned[:, int(outcome_index)] = probabilities[:, source_column]
-    return _normalized_probabilities(aligned)
+    return _normalized_probabilities(aligned, class_count=class_count)
 
 
 def _normalized_probabilities(
     probabilities: NDArray[np.float64],
+    *,
+    class_count: int = len(OUTCOME_NAMES),
 ) -> NDArray[np.float64]:
-    if probabilities.ndim != 2 or probabilities.shape[1] != len(OUTCOME_NAMES):
+    if probabilities.ndim != 2 or probabilities.shape[1] != class_count:
         raise EvaluationError("model returned an invalid probability shape")
     row_sums = np.sum(probabilities, axis=1)
     if (
@@ -160,9 +168,16 @@ def _normalized_probabilities(
 
 
 def _multiclass_log_loss(
-    y_true: NDArray[np.int64], probabilities: NDArray[np.float64]
+    y_true: NDArray[np.int64],
+    probabilities: NDArray[np.float64],
+    *,
+    class_count: int = len(OUTCOME_NAMES),
 ) -> float:
-    clipped = np.clip(_normalized_probabilities(probabilities), 1e-12, 1.0)
+    clipped = np.clip(
+        _normalized_probabilities(probabilities, class_count=class_count),
+        1e-12,
+        1.0,
+    )
     return float(-np.mean(np.log(clipped[np.arange(len(y_true)), y_true])))
 
 
@@ -172,31 +187,43 @@ def _calibrated_probabilities(
     temperature: float,
     prior_weight: float,
     class_prior: NDArray[np.float64],
+    class_count: int = len(OUTCOME_NAMES),
 ) -> NDArray[np.float64]:
     if temperature <= 0 or not 0 <= prior_weight < 1:
         raise EvaluationError("probability calibrator parameters are invalid")
-    normalized = np.clip(_normalized_probabilities(probabilities), 1e-12, 1.0)
+    normalized = np.clip(
+        _normalized_probabilities(probabilities, class_count=class_count),
+        1e-12,
+        1.0,
+    )
     logits = np.log(normalized) / temperature
     logits -= np.max(logits, axis=1, keepdims=True)
     scaled = np.exp(logits)
     scaled /= np.sum(scaled, axis=1, keepdims=True)
     blended = (1.0 - prior_weight) * scaled + prior_weight * class_prior[None, :]
-    return _normalized_probabilities(blended)
+    return _normalized_probabilities(blended, class_count=class_count)
 
 
 def fit_probability_calibrator(
-    probabilities: NDArray[np.float64], y_true: NDArray[np.int64]
+    probabilities: NDArray[np.float64],
+    y_true: NDArray[np.int64],
+    *,
+    class_names: tuple[str, ...] = OUTCOME_NAMES,
 ) -> ProbabilityCalibrator:
     """Fit a deterministic calibrator on a dedicated historical window only."""
 
     if len(probabilities) != len(y_true) or len(y_true) == 0:
         raise EvaluationError("probability calibration inputs are incompatible")
-    if len(np.unique(y_true)) != len(OUTCOME_NAMES):
+    if not class_names or len(set(class_names)) != len(class_names):
+        raise EvaluationError("probability calibration class names are invalid")
+    if len(np.unique(y_true)) != len(class_names):
         raise EvaluationError("probability calibration requires every outcome")
-    counts = np.bincount(y_true, minlength=len(OUTCOME_NAMES)).astype(np.float64)
+    counts = np.bincount(y_true, minlength=len(class_names)).astype(np.float64)
     # One pseudo-count avoids a zero prior without materially changing a real fold.
-    class_prior = (counts + 1.0) / (np.sum(counts) + len(OUTCOME_NAMES))
-    before = _multiclass_log_loss(y_true, probabilities)
+    class_prior = (counts + 1.0) / (np.sum(counts) + len(class_names))
+    before = _multiclass_log_loss(
+        y_true, probabilities, class_count=len(class_names)
+    )
     best_loss = before
     best_temperature = 1.0
     best_prior_weight = 0.0
@@ -207,8 +234,11 @@ def fit_probability_calibrator(
                 temperature=temperature,
                 prior_weight=prior_weight,
                 class_prior=class_prior,
+                class_count=len(class_names),
             )
-            loss = _multiclass_log_loss(y_true, candidate)
+            loss = _multiclass_log_loss(
+                y_true, candidate, class_count=len(class_names)
+            )
             if loss < best_loss - 1e-15:
                 best_loss = loss
                 best_temperature = temperature
@@ -217,15 +247,20 @@ def fit_probability_calibrator(
         temperature=best_temperature,
         prior_weight=best_prior_weight,
         class_prior=class_prior,
+        class_names=class_names,
         calibration_log_loss_before=before,
         calibration_log_loss_after=best_loss,
     )
 
 
 def _prior_prediction(
-    y_train: NDArray[np.int64], calibration_rows: int, test_rows: int
+    y_train: NDArray[np.int64],
+    calibration_rows: int,
+    test_rows: int,
+    *,
+    class_names: tuple[str, ...] = OUTCOME_NAMES,
 ) -> ModelPrediction:
-    counts = np.bincount(y_train, minlength=len(OUTCOME_NAMES)).astype(np.float64)
+    counts = np.bincount(y_train, minlength=len(class_names)).astype(np.float64)
     probabilities = counts / np.sum(counts)
     return ModelPrediction(
         name="class_prior",
@@ -249,12 +284,14 @@ def _logistic_prediction(
     seed: int,
     maximum_training_rows: int,
     training_threads: int,
+    class_names: tuple[str, ...] = OUTCOME_NAMES,
 ) -> ModelPrediction:
     available_rows = len(y_train)
     x_fit, y_fit = _time_uniform_training_sample(
         x_train,
         y_train,
         maximum_rows=maximum_training_rows,
+        class_names=class_names,
     )
     LOGGER.info(
         "Fitting logistic baseline on %d/%d time-uniform rows (RSS %.1f MiB)",
@@ -291,8 +328,12 @@ def _logistic_prediction(
     )
     return ModelPrediction(
         name="logistic",
-        calibration_probabilities=_aligned_probabilities(calibration_raw, classes),
-        probabilities=_aligned_probabilities(test_raw, classes),
+        calibration_probabilities=_aligned_probabilities(
+            calibration_raw, classes, class_count=len(class_names)
+        ),
+        probabilities=_aligned_probabilities(
+            test_raw, classes, class_count=len(class_names)
+        ),
         model_text=None,
         feature_importance=None,
         training_rows_available=available_rows,
@@ -306,6 +347,8 @@ def _lightgbm_prediction(
     x_calibration: NDArray[np.float32],
     x_test: NDArray[np.float32],
     parameters: EvaluationParameters,
+    *,
+    class_names: tuple[str, ...] = OUTCOME_NAMES,
 ) -> ModelPrediction:
     LOGGER.info(
         "Fitting LightGBM on %d rows with %d threads (RSS %.1f MiB)",
@@ -315,7 +358,7 @@ def _lightgbm_prediction(
     )
     model = LGBMClassifier(
         objective="multiclass",
-        num_class=len(OUTCOME_NAMES),
+        num_class=len(class_names),
         n_estimators=parameters.lightgbm_estimators,
         learning_rate=parameters.lightgbm_learning_rate,
         num_leaves=parameters.lightgbm_num_leaves,
@@ -343,8 +386,12 @@ def _lightgbm_prediction(
     booster = model.booster_
     return ModelPrediction(
         name="lightgbm",
-        calibration_probabilities=_aligned_probabilities(calibration_raw, classes),
-        probabilities=_aligned_probabilities(test_raw, classes),
+        calibration_probabilities=_aligned_probabilities(
+            calibration_raw, classes, class_count=len(class_names)
+        ),
+        probabilities=_aligned_probabilities(
+            test_raw, classes, class_count=len(class_names)
+        ),
         model_text=booster.model_to_string(),
         feature_importance=np.asarray(
             booster.feature_importance(importance_type="gain"), dtype=np.float64
@@ -360,8 +407,12 @@ def fit_fold_models(
     x_calibration: NDArray[np.float32],
     x_test: NDArray[np.float32],
     parameters: EvaluationParameters,
+    *,
+    class_names: tuple[str, ...] = OUTCOME_NAMES,
 ) -> tuple[ModelPrediction, ...]:
-    if len(np.unique(y_train)) != len(OUTCOME_NAMES):
+    if not class_names or len(set(class_names)) != len(class_names):
+        raise EvaluationError("model class names are invalid")
+    if len(np.unique(y_train)) != len(class_names):
         raise EvaluationError("training rows must contain all supported outcomes")
     if len(x_calibration) == 0 or len(x_test) == 0:
         raise EvaluationError("calibration and test matrices must be non-empty")
@@ -371,7 +422,12 @@ def fit_fold_models(
         len(x_calibration),
         len(x_test),
     )
-    prior = _prior_prediction(y_train, len(x_calibration), len(x_test))
+    prior = _prior_prediction(
+        y_train,
+        len(x_calibration),
+        len(x_test),
+        class_names=class_names,
+    )
     logistic = _logistic_prediction(
         x_train,
         y_train,
@@ -380,6 +436,7 @@ def fit_fold_models(
         seed=parameters.random_seed,
         maximum_training_rows=parameters.logistic_max_training_rows,
         training_threads=parameters.training_threads,
+        class_names=class_names,
     )
     release_unused_process_memory()
     lightgbm_prediction = _lightgbm_prediction(
@@ -388,23 +445,29 @@ def fit_fold_models(
         x_calibration,
         x_test,
         parameters,
+        class_names=class_names,
     )
     release_unused_process_memory()
     return prior, logistic, lightgbm_prediction
 
 
 def classification_metrics(
-    y_true: NDArray[np.int64], probabilities: NDArray[np.float64]
+    y_true: NDArray[np.int64],
+    probabilities: NDArray[np.float64],
+    *,
+    class_names: tuple[str, ...] = OUTCOME_NAMES,
 ) -> dict[str, object]:
+    if not class_names or len(set(class_names)) != len(class_names):
+        raise EvaluationError("classification metric class names are invalid")
     if len(y_true) != len(probabilities) or probabilities.shape[1] != len(
-        OUTCOME_NAMES
+        class_names
     ):
         raise EvaluationError("classification metric inputs have incompatible shapes")
     clipped = np.clip(probabilities, 1e-12, 1.0)
     clipped /= np.sum(clipped, axis=1, keepdims=True)
     selected = clipped[np.arange(len(y_true)), y_true]
     log_loss = float(-np.mean(np.log(selected)))
-    one_hot = np.eye(len(OUTCOME_NAMES), dtype=np.float64)[y_true]
+    one_hot = np.eye(len(class_names), dtype=np.float64)[y_true]
     brier = float(np.mean(np.sum((clipped - one_hot) ** 2, axis=1)))
     predicted = np.argmax(clipped, axis=1)
     accuracy = float(np.mean(predicted == y_true))
@@ -420,7 +483,7 @@ def classification_metrics(
             calibration_error += float(np.mean(mask)) * abs(
                 float(np.mean(confidence[mask])) - float(np.mean(correctness[mask]))
             )
-    class_counts = np.bincount(y_true, minlength=len(OUTCOME_NAMES))
+    class_counts = np.bincount(y_true, minlength=len(class_names))
     return {
         "rows": len(y_true),
         "log_loss": log_loss,
@@ -429,14 +492,14 @@ def classification_metrics(
         "expected_calibration_error_10_bins": calibration_error,
         "mean_probabilities": {
             name: float(np.mean(clipped[:, index]))
-            for index, name in enumerate(OUTCOME_NAMES)
+            for index, name in enumerate(class_names)
         },
         "observed_fractions": {
             name: float(class_counts[index] / len(y_true))
-            for index, name in enumerate(OUTCOME_NAMES)
+            for index, name in enumerate(class_names)
         },
         "outcomes": {
-            name: int(class_counts[index]) for index, name in enumerate(OUTCOME_NAMES)
+            name: int(class_counts[index]) for index, name in enumerate(class_names)
         },
     }
 

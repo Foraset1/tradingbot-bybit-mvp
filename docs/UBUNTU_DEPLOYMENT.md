@@ -326,6 +326,32 @@ sudo chown foraset1:foraset1 \
 Полный порядок запуска в `tmux`, assumptions и границы интерпретации описаны в
 [`EXECUTION_RESEARCH.md`](EXECUTION_RESEARCH.md).
 
+После проверки V3 manifest отдельный execution-aware backtest запускается для одного
+зафиксированного сценария. На текущем 4 CPU / 8 GB сервере не запускать горизонты параллельно:
+
+```bash
+REPORT_DIR=/home/foraset1/tradingbot-reports
+EXECUTION_DATASET=/data/execution-research/execution-research-v1-<fingerprint>
+STAMP=$(date -u +%Y%m%d-%H%M%S)
+
+sudo docker compose run --rm --no-deps collector \
+  python -m tradingbot run-execution-backtest \
+  --execution-dataset "$EXECUTION_DATASET" \
+  --output-root /data/execution-evaluations \
+  --horizon-minutes 15 \
+  --order-notional-usdt 50 \
+  > "$REPORT_DIR/execution-backtest-h15-n50-$STAMP-build.json" \
+  2> "$REPORT_DIR/execution-backtest-h15-n50-$STAMP.log"
+sudo chown foraset1:foraset1 \
+  "$REPORT_DIR/execution-backtest-h15-n50-$STAMP-build.json" \
+  "$REPORT_DIR/execution-backtest-h15-n50-$STAMP.log"
+```
+
+Команда проверяет SHA-256 V3 dataset, обучает отдельные fill/post-fill модели, применяет
+fee/funding/slippage, partial unwind и единый лимит одной позиции на все пары. Полный контракт,
+сохранение `report.json`/`manifest.json` и ограничения интерпретации описаны в
+[`EXECUTION_RESEARCH.md`](EXECUTION_RESEARCH.md).
+
 Offline baseline/LightGBM/backtest запускается из конкретного неизменяемого research dataset:
 
 ```bash

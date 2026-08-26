@@ -257,6 +257,22 @@ V3 может безопасно использовать дни со стату
 а исключает feature/entry/post-fill окна, пересекающие kline gap, слишком большой разрыв
 стакана или смену WebSocket-сессии.
 
+Из одного неизменяемого V3 dataset запускается отдельная execution-aware оценка. Один запуск
+фиксирует ровно один горизонт и один reference-номинал, обучает независимые fill и post-fill
+модели и затем выбирает не больше одного maker-ордера среди всех пар в каждую минуту:
+
+```bash
+tradingbot run-execution-backtest \
+  --execution-dataset data/execution-research/execution-research-v1-<fingerprint> \
+  --output-root data/execution-evaluations \
+  --horizon-minutes 15 \
+  --order-notional-usdt 50
+```
+
+Сравниваются class-prior, logistic и LightGBM, а для обучаемых моделей — raw и отдельно
+калиброванные вероятности. `PARTIAL_FILL` не превращается в полную позицию: остаток отменяется,
+а исполненная доля закрывается taker-ордером в симуляции.
+
 Техническая offline-оценка строится из неизменяемого research dataset:
 
 ```bash
@@ -274,12 +290,13 @@ tradingbot run-backtest \
 по символам, ablation календарных признаков и diagnostics selection bias. История короче
 44 дней запускает только технический 70/30 smoke-test; следующий зафиксированный model review
 требует 365 завершённых UTC дней и минимум трёх временных folds.
-Даже тогда нельзя делать вывод о реальной доходности. V3 уже строит консервативные proxy
-labels `NO_FILL/PARTIAL_FILL/FULL_FILL` из секундных L50 snapshots и public trades, но не
-наблюдает реальный order acknowledgement, точное место ордера, hidden liquidity и все
-отмены внутри очереди. Небезопасные временные окна уже отбрасываются по kline/orderbook
-continuity и `session_id`. Следующие gates — fill-модель, execution-aware backtest и
-калибровка proxy по demo fills. Только после них возможен paper/testnet этап.
+Даже тогда нельзя делать вывод о реальной доходности. V3 строит консервативные proxy labels
+`NO_FILL/PARTIAL_FILL/FULL_FILL`, а execution-aware evaluator отдельно моделирует fill и
+post-fill outcome, учитывает maker/taker fee, funding, slippage, partial unwind и правило одной
+позиции на все пары. Но публичные L50 snapshots не показывают реальный order acknowledgement,
+точное место ордера, hidden liquidity и все отмены внутри очереди. Следующие gates — более
+длинный V3 walk-forward, калибровка proxy по Bybit Demo fills и Shadow Mode. Только после них
+возможен paper/testnet этап.
 
 Это исследовательское ПО, а не финансовая рекомендация. Даже хорошо протестированная
 модель может потерять деньги из-за смены режима рынка, ошибок исполнения или сбоя биржи.
