@@ -88,6 +88,20 @@ def _number(value: object, label: str) -> float:
     return result
 
 
+def _validate_symbol_universe(
+    configured_symbols: tuple[str, ...],
+    frozen_symbols: tuple[str, ...],
+) -> None:
+    if len(frozen_symbols) != len(set(frozen_symbols)):
+        raise ShadowBundleError("shadow universe contains duplicate symbols")
+    if len(configured_symbols) != len(frozen_symbols) or set(
+        configured_symbols
+    ) != set(frozen_symbols):
+        raise ShadowBundleError(
+            "configured Bybit symbol set must exactly match the frozen bundle universe"
+        )
+
+
 def _research_parameters(bundle: ShadowBundle) -> ExecutionResearchParameters:
     raw = _object(bundle.contract.get("research_parameters"), "research_parameters")
     scenario = _object(bundle.contract.get("scenario"), "scenario")
@@ -163,10 +177,7 @@ class ShadowRuntime:
         ):
             raise ShadowBundleError("shadow universe is invalid")
         symbols = tuple(cast(list[str], symbols_raw))
-        if symbols != config.bybit.symbols:
-            raise ShadowBundleError(
-                "configured Bybit symbols must exactly match the frozen bundle order"
-            )
+        _validate_symbol_universe(config.bybit.symbols, symbols)
         if config.risk.max_open_positions != 1:
             raise ShadowBundleError("Shadow Mode requires exactly one global position")
         if config.bybit.public_ws_url != FROZEN_PUBLIC_WS_URL:
