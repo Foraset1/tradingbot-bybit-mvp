@@ -25,7 +25,10 @@ from tradingbot.shadow.bundle import (
 from tradingbot.shadow.journal import ShadowJournal
 from tradingbot.shadow.live import LiveMarketWindow
 from tradingbot.shadow.model import ShadowScorer
-from tradingbot.shadow.runtime import reject_trading_credentials
+from tradingbot.shadow.runtime import (
+    _validate_symbol_universe,
+    reject_trading_credentials,
+)
 
 
 def _sha256(path: Path) -> str:
@@ -513,6 +516,17 @@ def test_shadow_refuses_any_trading_credentials() -> None:
     reject_trading_credentials({})
     with pytest.raises(ShadowBundleError, match="BYBIT_API_KEY"):
         reject_trading_credentials({"BYBIT_API_KEY": "must-not-be-present"})
+
+
+def test_shadow_symbol_universe_is_exact_but_order_independent() -> None:
+    configured = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
+
+    _validate_symbol_universe(configured, ("ETHUSDT", "SOLUSDT", "BTCUSDT"))
+
+    with pytest.raises(ShadowBundleError, match="exactly match"):
+        _validate_symbol_universe(configured, ("BTCUSDT", "ETHUSDT", "XRPUSDT"))
+    with pytest.raises(ShadowBundleError, match="duplicate"):
+        _validate_symbol_universe(configured, ("BTCUSDT", "ETHUSDT", "ETHUSDT"))
 
 
 def test_live_window_clears_all_rows_on_websocket_session_change() -> None:
