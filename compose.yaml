@@ -46,6 +46,66 @@ services:
         max-size: 20m
         max-file: "5"
 
+  shadow:
+    profiles: ["shadow"]
+    build: .
+    init: true
+    restart: unless-stopped
+    depends_on:
+      collector:
+        condition: service_healthy
+    command:
+      - python
+      - -m
+      - tradingbot
+      - shadow
+      - --bundle
+      - ${TRADINGBOT_SHADOW_BUNDLE:-/data/shadow-bundles/NOT_CONFIGURED}
+      - --shadow-root
+      - /data/shadow
+      - --run-id
+      - ${TRADINGBOT_SHADOW_RUN_ID:-shadow-public-v1}
+    environment:
+      TRADINGBOT_CONFIG: ${TRADINGBOT_CONFIG:-/app/config/tradingbot.toml}
+      TRADINGBOT_DATA_ROOT: ${TRADINGBOT_DATA_ROOT:-/data/raw}
+      TRADINGBOT_HEALTH_PATH: ${TRADINGBOT_HEALTH_PATH:-/app/runtime/collector-health.json}
+      TRADINGBOT_MIN_FREE_BYTES: ${TRADINGBOT_MIN_FREE_BYTES:-16106127360}
+      TRADINGBOT_ARCHIVE_ROOT: ${TRADINGBOT_ARCHIVE_ROOT:-/data/archive}
+      TRADINGBOT_RAW_RETENTION_DAYS: ${TRADINGBOT_RAW_RETENTION_DAYS:-7}
+      TRADINGBOT_HISTORY_ROOT: ${TRADINGBOT_HISTORY_ROOT:-/data/history}
+      TRADINGBOT_SHADOW_RUN_ID: ${TRADINGBOT_SHADOW_RUN_ID:-shadow-public-v1}
+    volumes:
+      - market-data:/data
+      - collector-runtime:/app/runtime
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: ${TRADINGBOT_SHADOW_MEMORY:-2g}
+    cpus: ${TRADINGBOT_SHADOW_CPUS:-1.5}
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import json,os,time;
+          p='/data/shadow/'+os.environ['TRADINGBOT_SHADOW_RUN_ID']+'/health.json';
+          h=json.load(open(p,encoding='utf-8'));
+          assert h.get('status')=='running';
+          assert h.get('scope',{}).get('order_submission') is False;
+          assert time.time_ns()-h.get('updated_at_ns',0)<90000000000"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
+
 volumes:
   market-data:
   collector-runtime:

@@ -54,7 +54,8 @@ download_attempts = 3
 maximum_missing_minutes = 5
 
 [risk]
-# These values are documented now and will only be used by a later trading service.
+# Shadow Mode uses these values only for simulated sizing and its journaled loss gate.
+# No component in this version can submit an exchange order.
 max_notional_fraction = 0.05
 target_risk_fraction = 0.005
 max_planned_risk_fraction = 0.007

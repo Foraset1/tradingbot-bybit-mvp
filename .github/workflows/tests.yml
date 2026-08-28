@@ -17,6 +17,7 @@ jobs:
       - run: python -m ruff check .
       - run: python -m mypy
       - run: python -m pytest
+      - run: docker compose config --quiet
       - run: docker build --tag tradingbot-ci .
       - run: >-
           docker run --rm --entrypoint python tradingbot-ci -c

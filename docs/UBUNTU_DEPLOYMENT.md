@@ -1,8 +1,8 @@
 # Постоянный collector на Ubuntu Server 24.04
 
 Эта инструкция разворачивает текущую read-only версию: публичные WebSocket-потоки Bybit,
-нормализацию, JSONL-хранилище, health telemetry и аудит данных. API-ключи, отправка ордеров и
-рабочая торговая модель в эту версию ещё не входят.
+нормализацию, JSONL-хранилище, health telemetry, аудит данных и опциональный публичный
+Shadow Mode. API-ключи и отправка ордеров в эту версию не входят.
 
 Профиль постоянного MVP: Ubuntu Server 24.04 LTS x86_64, 6 vCPU, 10 GB RAM, 100 GB NVMe,
 статический IPv4 и не менее 100 Mbit/s. Collector получает лимит 4 CPU и 6 GB RAM, оставляя
@@ -351,6 +351,12 @@ sudo chown foraset1:foraset1 \
 fee/funding/slippage, partial unwind и единый лимит одной позиции на все пары. Полный контракт,
 сохранение `report.json`/`manifest.json` и ограничения интерпретации описаны в
 [`EXECUTION_RESEARCH.md`](EXECUTION_RESEARCH.md).
+
+Из завершённого execution-aware эксперимента можно собрать неизменяемый bundle и запустить
+модель на отдельном публичном WebSocket без ордеров. Для короткой истории это только
+инженерный `technical_smoke`; необходим явный флаг, а bundle сохраняет
+`eligible_for_trading=false`. Пошаговые команды, Compose-профиль, 61-минутный warm-up и
+проверка hash-chain журнала описаны в [`SHADOW_MODE.md`](SHADOW_MODE.md).
 
 Offline baseline/LightGBM/backtest запускается из конкретного неизменяемого research dataset:
 

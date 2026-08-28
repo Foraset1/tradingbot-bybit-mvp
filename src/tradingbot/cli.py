@@ -265,6 +265,84 @@ def _parser() -> argparse.ArgumentParser:
             "(default: 50 USDT)"
         ),
     )
+    shadow_bundle = subparsers.add_parser(
+        "build-shadow-bundle",
+        help=(
+            "Freeze one authenticated execution-evaluation fold for read-only "
+            "live shadowing; never retrains"
+        ),
+    )
+    shadow_bundle.add_argument(
+        "--execution-evaluation",
+        type=Path,
+        required=True,
+        help="Verified execution-backtest-v1 directory",
+    )
+    shadow_bundle.add_argument(
+        "--execution-dataset",
+        type=Path,
+        required=True,
+        help="Exact execution-research-v1 directory used by that evaluation",
+    )
+    shadow_bundle.add_argument(
+        "--output-root",
+        type=Path,
+        default=None,
+        help="Bundle parent directory (defaults to shadow-bundles beside storage.root)",
+    )
+    shadow_bundle.add_argument(
+        "--allow-engineering-only",
+        "--allow-technical-smoke",
+        dest="allow_technical_smoke",
+        action="store_true",
+        help=(
+            "Explicitly allow an unreviewed engineering-only bundle; "
+            "--allow-technical-smoke is a compatibility alias"
+        ),
+    )
+    validate_shadow = subparsers.add_parser(
+        "validate-shadow-bundle",
+        help="Verify every frozen Shadow Mode artifact and print its safety scope",
+    )
+    validate_shadow.add_argument(
+        "--bundle",
+        type=Path,
+        required=True,
+        help="shadow-bundle-v1 directory containing manifest.json",
+    )
+    shadow = subparsers.add_parser(
+        "shadow",
+        help="Observe public Bybit data and journal model decisions without orders",
+    )
+    shadow.add_argument(
+        "--bundle",
+        type=Path,
+        required=True,
+        help="Verified immutable shadow-bundle-v1 directory",
+    )
+    shadow.add_argument(
+        "--shadow-root",
+        type=Path,
+        default=None,
+        help="Journal parent directory (defaults to shadow beside storage.root)",
+    )
+    shadow.add_argument(
+        "--run-id",
+        default=None,
+        help="Optional stable run ID for one restartable journal",
+    )
+    shadow.add_argument(
+        "--run-seconds",
+        type=float,
+        default=None,
+        help="Stop automatically after N seconds (useful for smoke tests)",
+    )
+    shadow.add_argument(
+        "--processing-delay-ms",
+        type=int,
+        default=750,
+        help="Wait after each UTC decision timestamp before causal scoring (default: 750)",
+    )
     archive = subparsers.add_parser(
         "archive-day",
         help=(
@@ -906,6 +984,115 @@ def _run_execution_backtest(
     print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
 
 
+def _run_build_shadow_bundle(
+    config: AppConfig,
+    execution_evaluation: Path,
+    execution_dataset: Path,
+    output_root: Path | None,
+    allow_technical_smoke: bool,
+) -> None:
+    try:
+        from tradingbot.shadow.bundle import (
+            ShadowBundleError,
+            build_shadow_bundle,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name in {"lightgbm", "numpy", "pyarrow"} or (
+            exc.name or ""
+        ).startswith(("lightgbm.", "numpy.", "pyarrow.")):
+            LOGGER.error(
+                "Shadow bundle support is not installed; install the project with "
+                "the [research] extra"
+            )
+            raise SystemExit(1) from exc
+        raise
+    destination = (
+        config.storage.root.parent / "shadow-bundles"
+        if output_root is None
+        else output_root
+    )
+    try:
+        bundle = build_shadow_bundle(
+            execution_evaluation=execution_evaluation,
+            execution_dataset=execution_dataset,
+            output_root=destination,
+            allow_technical_smoke=allow_technical_smoke,
+        )
+    except ShadowBundleError as exc:
+        LOGGER.error("Shadow bundle build rejected: %s", exc)
+        raise SystemExit(1) from exc
+    print(json.dumps(bundle.to_dict(), indent=2, sort_keys=True))
+
+
+def _run_validate_shadow_bundle(bundle_path: Path) -> None:
+    try:
+        from tradingbot.shadow.bundle import (
+            ShadowBundleError,
+            validate_shadow_bundle,
+        )
+        from tradingbot.shadow.model import ShadowScorer
+    except ModuleNotFoundError as exc:
+        if exc.name in {"lightgbm", "numpy", "pyarrow"} or (
+            exc.name or ""
+        ).startswith(("lightgbm.", "numpy.", "pyarrow.")):
+            LOGGER.error(
+                "Shadow validation support is not installed; install the project "
+                "with the [research] extra"
+            )
+            raise SystemExit(1) from exc
+        raise
+    try:
+        bundle = validate_shadow_bundle(bundle_path)
+        ShadowScorer(bundle)
+    except ShadowBundleError as exc:
+        LOGGER.error("Shadow bundle validation rejected: %s", exc)
+        raise SystemExit(1) from exc
+    print(json.dumps(bundle.to_dict(), indent=2, sort_keys=True))
+
+
+def _run_shadow(
+    config: AppConfig,
+    bundle_path: Path,
+    shadow_root: Path | None,
+    run_id: str | None,
+    run_seconds: float | None,
+    processing_delay_ms: int,
+) -> None:
+    try:
+        from tradingbot.shadow.bundle import ShadowBundleError
+        from tradingbot.shadow.runtime import run_shadow_mode
+    except ModuleNotFoundError as exc:
+        if exc.name in {"lightgbm", "numpy", "pyarrow"} or (
+            exc.name or ""
+        ).startswith(("lightgbm.", "numpy.", "pyarrow.")):
+            LOGGER.error(
+                "Shadow runtime support is not installed; install the project with "
+                "the [research] extra"
+            )
+            raise SystemExit(1) from exc
+        raise
+    destination = (
+        config.storage.root.parent / "shadow"
+        if shadow_root is None
+        else shadow_root
+    )
+    try:
+        result = asyncio.run(
+            run_shadow_mode(
+                config=config,
+                bundle_path=bundle_path,
+                shadow_root=destination,
+                run_id=run_id,
+                run_seconds=run_seconds,
+                processing_delay_ms=processing_delay_ms,
+            )
+        )
+    except ShadowBundleError as exc:
+        LOGGER.error("Shadow Mode rejected: %s", exc)
+        raise SystemExit(1) from exc
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
 def _run_archive_day(
     config: AppConfig,
     partition_date: str | None,
@@ -1252,6 +1439,28 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.output_root,
             args.horizon_minutes,
             args.order_notional_usdt,
+        )
+        return
+    if args.command == "build-shadow-bundle":
+        _run_build_shadow_bundle(
+            config,
+            args.execution_evaluation,
+            args.execution_dataset,
+            args.output_root,
+            args.allow_technical_smoke,
+        )
+        return
+    if args.command == "validate-shadow-bundle":
+        _run_validate_shadow_bundle(args.bundle)
+        return
+    if args.command == "shadow":
+        _run_shadow(
+            config,
+            args.bundle,
+            args.shadow_root,
+            args.run_id,
+            args.run_seconds,
+            args.processing_delay_ms,
         )
         return
     if args.command == "archive-day":
