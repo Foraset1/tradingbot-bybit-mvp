@@ -36,6 +36,7 @@ import pyarrow.parquet as pq  # type: ignore[import-untyped]
 from tradingbot import __version__
 from tradingbot.data.audit import AUDIT_REPORT_SCHEMA_VERSION
 from tradingbot.data.quality import read_archive_acceptance
+from tradingbot.market.records import MarketRecord
 
 DATASET_SCHEMA_VERSION: Final = 1
 PARQUET_FORMAT_VERSION: Final = "2.6"
@@ -743,6 +744,33 @@ def _kline_row(raw: dict[str, Any], common: dict[str, Any]) -> dict[str, Any]:
         }
     )
     return result
+
+
+def canonical_rows_from_market_record(
+    record: MarketRecord,
+    *,
+    source_path: str = "<memory>",
+    source_line: int = 1,
+) -> tuple[dict[str, Any], ...]:
+    """Convert one normalized public record with the canonical parser.
+
+    The live shadow runtime intentionally reuses the same validation and field
+    mapping as the immutable Parquet builder.  It does not persist these rows.
+    """
+
+    raw = record.to_dict()
+    common = _common_row(raw, source_path, source_line)
+    if record.kind == "orderbook":
+        return (_orderbook_row(raw, common),)
+    if record.kind == "ticker":
+        return (_ticker_row(raw, common),)
+    if record.kind == "trades":
+        return tuple(_trade_rows(raw, common))
+    if record.kind.startswith("kline_"):
+        return (_kline_row(raw, common),)
+    raise DatasetBuildError(
+        f"unsupported live market record kind: {record.kind!r}"
+    )
 
 
 class _CanonicalKlines:

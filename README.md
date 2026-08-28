@@ -2,8 +2,9 @@
 
 Безопасная read-only основа проекта: сборщик публичных рыночных данных Bybit,
 канонический Parquet-слой, воспроизводимые causal features/market labels,
-execution-aware proxy labels и offline-оценка локальной модели. Эта версия **не принимает
-live-решений, не запрашивает API-ключи и не умеет отправлять ордера**.
+execution-aware proxy labels, offline-оценка локальной модели и безопасный read-only
+Shadow Mode. Эта версия рассчитывает и журналирует live-кандидаты только по публичным
+данным, **не запрашивает API-ключи и не умеет отправлять ордера**.
 
 Поддерживаемые USDT perpetual пары:
 
@@ -70,6 +71,12 @@ live-решений, не запрашивает API-ключи и не умее
 - backtest, выбирающий одну пару/сторону и учитывающий комиссии, slippage, funding,
   лимит номинала, одну позицию и rolling 24h loss gate;
 - versioned evaluation report, модели и Parquet-ledger сделок с SHA-256 проверкой;
+- неизменяемый Shadow bundle с точными моделями последнего проверенного fold, калибровкой,
+  execution estimates и полным SHA-256 manifest;
+- отдельный публичный live Shadow Mode с 61-минутным causal warm-up, единым one-position
+  lock, rolling loss gate и консервативным proxy settlement;
+- single-writer hash-chain журнал решений, безопасное восстановление и атомарный health;
+- жёсткий отказ Shadow Mode при наличии trading credential env vars;
 - строгая проверка конфигурации и заранее зафиксированных risk-инвариантов;
 - контейнерный запуск и автоматические проверки.
 
@@ -104,6 +111,8 @@ Bootstrap бесплатной официальной истории сдело�
 [`docs/EXECUTION_RESEARCH.md`](docs/EXECUTION_RESEARCH.md).
 Запуск baseline, LightGBM и cost-aware backtest описан в
 [`docs/RESEARCH_BACKTEST.md`](docs/RESEARCH_BACKTEST.md).
+Сборка frozen model bundle и постоянный публичный Shadow Mode описаны в
+[`docs/SHADOW_MODE.md`](docs/SHADOW_MODE.md).
 Пошаговое production-развёртывание на Ubuntu Server 24.04 описано в
 [`docs/UBUNTU_DEPLOYMENT.md`](docs/UBUNTU_DEPLOYMENT.md).
 
@@ -285,8 +294,10 @@ tradingbot run-backtest \
 ## Границы текущей версии
 
 В проекте пока намеренно нет приватного API Bybit, ключей, плеча, исполнения ордеров,
-торговой стратегии или обещания доходности. Baseline, LightGBM и purged walk-forward backtest
-уже реализованы. Evaluation V2 добавляет отдельное purged calibration-окно, coverage gate
+автоматической торговли или обещания доходности. Исследовательская policy уже формирует
+кандидатов в Shadow Mode, но они существуют только в симуляционном журнале. Baseline,
+LightGBM и purged walk-forward backtest реализованы. Evaluation V2 добавляет отдельное
+purged calibration-окно, coverage gate
 по символам, ablation календарных признаков и diagnostics selection bias. История короче
 44 дней запускает только технический 70/30 smoke-test; следующий зафиксированный model review
 требует 365 завершённых UTC дней и минимум трёх временных folds.
@@ -294,9 +305,10 @@ tradingbot run-backtest \
 `NO_FILL/PARTIAL_FILL/FULL_FILL`, а execution-aware evaluator отдельно моделирует fill и
 post-fill outcome, учитывает maker/taker fee, funding, slippage, partial unwind и правило одной
 позиции на все пары. Но публичные L50 snapshots не показывают реальный order acknowledgement,
-точное место ордера, hidden liquidity и все отмены внутри очереди. Следующие gates — более
-длинный V3 walk-forward, калибровка proxy по Bybit Demo fills и Shadow Mode. Только после них
-возможен paper/testnet этап.
+точное место ордера, hidden liquidity и все отмены внутри очереди. Read-only Shadow Mode уже
+может проверить live causal pipeline, но короткий dataset остаётся `engineering_only` и
+`eligible_for_trading=false`. Следующие gates — 365-дневный V3 walk-forward и калибровка
+proxy по Bybit Demo fills. Только после них возможен отдельный paper/testnet этап.
 
 Это исследовательское ПО, а не финансовая рекомендация. Даже хорошо протестированная
 модель может потерять деньги из-за смены режима рынка, ошибок исполнения или сбоя биржи.
